@@ -1,161 +1,156 @@
-# [name TBD]
+# fetch.py
 
-> A punk-rock HTTP client for Python — how you'd build Requests today if you
-> were starting fresh.
+> HTTP you can keep in your pocket — one readable Python file, no dependencies.
 
-**One readable Python file. Install it, copy it into your project, make it yours.**
+How you'd build a tiny humane HTTP client today if vendoring was the goal,
+not a dependency tree.
 
-**Status:** README-driven design. These examples describe the API we want to
-build. The name, engine, and concurrency model are still open.
+```python
+import fetch
 
-**Working titles:** `fetchy` · `wire` · `ask`. These are naming directions;
-all three already have PyPI projects. See [Name](#name).
+data = fetch.get("https://httpbin.org/get", params={"q": "punk"}).json()
+```
+
+Copy `fetch.py` into your project, or install the package. Timeouts and TLS
+verification are on. HTTP/1.1, synchronous, Python 3.11+.
 
 ## Why
 
-[Requests](https://requests.readthedocs.io/) taught a generation that HTTP could
-feel human. The world moved on: HTTP/2, HTTP/3, async everywhere, typing as a
-default. That deserves a fresh look at what an HTTP client should be.
+[Requests](https://requests.readthedocs.io/) taught a generation that HTTP
+could feel human. This is a spiritual cousin with a different spine:
 
-A spiritual successor with a different spine:
+- **One file** — the implementation is a single module you can read and own.
+- **Zero dependencies** — stdlib only (`urllib`, `ssl`, `json`, …).
+- **Humane** — `get` / `post` / … and a small `Response`.
+- **Honest defaults** — finite timeout (30s), cert verification, HTTP 4xx/5xx
+  raise unless you opt out.
 
-- **Humane** — one obvious way to GET/POST and read a body.
-- **Punk** — tiny core, ruthless defaults, no cathedral.
-- **Modern** — typed from day one; streaming and concurrency considered before
-  the API hardens.
-- **Honest** — clear limits, visible dependencies, optional pieces that compose
-  without taking over your application.
+Not Requests 2. Not HTTPX with different branding. Not a framework.
 
-## Priorities (non-negotiable)
+## Install
 
-1. Clarity over cleverness.
-2. Small, copyable core over kitchen sink.
-3. A finite timeout by default, with an explicit override.
-4. Types that help, not ceremony.
-5. Docs a stranger can use in under a minute.
+```bash
+pip install -e /path/to/fetch.py   # local editable, for now
+# or: copy fetch.py next to your code and `import fetch`
+```
 
-## Quickstart (target API)
+PyPI distribution name is **`fetch.py`** (the import is still `fetch`).
+Plain [`fetch`](https://pypi.org/project/fetch/) is an unrelated legacy package.
 
-`fetchy` is a placeholder import name throughout these examples.
+## Quickstart
 
 ```python
-from fetchy import get, post
+import fetch
 
-r = get("https://httpbin.org/get", params={"q": "punk"})
-r.raise_for_status()
+r = fetch.get("https://httpbin.org/get", params={"q": "punk"})
+print(r.status, r.url)
 print(r.json())
 
-r = post(
+r = fetch.post(
     "https://httpbin.org/post",
     json={"hello": "world"},
     timeout=10,
 )
-r.raise_for_status()
-print(r.status_code, r.text[:80])
+print(r.status, r.text[:80])
 ```
 
-One response type, with `status_code`, case-insensitive `headers`, `content`
-(bytes), `text`, and `json()`.
-
-This sketch uses **explicit status checking**: an HTTP response is returned
-even for 4xx or 5xx; `raise_for_status()` turns those statuses into exceptions.
-Connection failures and timeouts raise when the request cannot complete.
-
-### Session-shaped reuse
+Inspect without raising on error statuses:
 
 ```python
-from fetchy import Session
-
-with Session(headers={"User-Agent": "punk/0.1"}) as s:
-    print(s.get("https://example.com").status_code)
+r = fetch.get("https://httpbin.org/status/404", check_status=False)
+print(r.status, r.ok)
+r.raise_for_status()  # -> fetch.HTTPError
 ```
 
-A session gives repeated calls an explicit home for shared configuration and
-connection reuse. The context manager owns cleanup. The same request options
-should mean the same thing inside and outside a session.
+Verbs: `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, plus
+`request(method, url, ...)`.
 
-## Design notes
+## Response
 
-### One file
+`Response` is fully buffered — no open socket, no `close()`.
 
-Copying the core into a project is a supported use case, not a build trick.
-Package metadata, tests, and docs can live around it; the implementation should
-remain one readable source file.
+| attr / method | meaning |
+|---|---|
+| `status` | HTTP status code |
+| `reason` | reason phrase |
+| `headers` | case-insensitive mapping (`get_all` for repeats) |
+| `content` | raw body `bytes` (gzip decoded when declared) |
+| `text` | decoded text (charset from Content-Type, else UTF-8) |
+| `json()` | parsed JSON |
+| `url` | final URL after redirects |
+| `ok` | `True` if 2xx |
+| `raise_for_status()` | raise `HTTPError` if status ≥ 400 |
 
-One file and zero dependencies are separate promises. Dependency-free is
-appealing, but the engine decision must make clear what copying the file
-requires. Packaging and typing support should serve this shape.
+## Errors
 
-### Sync / async
+| type | when |
+|---|---|
+| `HTTPError` | 4xx/5xx when `check_status=True` (default); `.response` is set |
+| `Timeout` | socket operation exceeded `timeout` |
+| `RequestError` | connection / TLS / protocol failure |
+| `RedirectError` | too many redirects, bad Location, or HTTPS→HTTP |
+| `DecodeError` | body/gzip/text/JSON decode failure |
+| `ValueError` / `TypeError` | bad arguments (invalid URL, headers, timeout, …) |
 
-Pick one coherent story and document it with examples before scaffolding.
-The examples above sketch synchronous usage; they do not settle the execution
-model.
+Invalid arguments fail fast. Network and HTTP failures use the hierarchy above.
 
-Streaming, concurrency, cancellation, and resource ownership belong in that
-design conversation. Decide what happens when a caller stops reading or cancels
-a request before committing to the API.
+## Defaults (what the code actually does)
 
-### Engine
+- **Timeout:** `30.0` seconds — per socket operation, not a total deadline.
+  Must be a finite positive number.
+- **TLS:** verified (pass `context=` for a custom `ssl.SSLContext`).
+- **Status:** `check_status=True` → 4xx/5xx raise `HTTPError`.
+- **Redirects:** followed (`follow_redirects=True`, `max_redirects=10`).
+  POST on 301/302 and non-HEAD on 303 become GET; credentials stripped on
+  origin change; HTTPS→HTTP refused.
+- **Proxies / env:** off unless `trust_env=True`.
+- **Body:** `json=` and `data=` are mutually exclusive; `Content-Length` is
+  calculated for you.
+- **No retries.** No streaming API yet. No `Session` yet.
 
-Use the standard library where it fits. If an HTTP engine earns a dependency,
-explain why in one paragraph: what it provides, what it costs, and how it affects
-the single-file experience.
+## API sketch
 
-HTTP/2 and HTTP/3 are part of the design context, not promises of v0 support.
-Document the supported protocols when choosing the engine.
+```python
+fetch.request(
+    method: str,
+    url: str,
+    *,
+    params=None,
+    headers=None,
+    json=...,          # any JSON value, including None
+    data=None,         # bytes | str | mapping (form)
+    timeout=30.0,
+    follow_redirects=True,
+    max_redirects=10,
+    check_status=True,
+    trust_env=False,
+    context=None,      # ssl.SSLContext
+) -> Response
+```
 
-### Defaults
+URLs must be absolute `http://` or `https://`. Credentials in the URL are
+rejected — put them in headers.
 
-- Every request has a finite timeout. Define the default duration and whether
-  the limit applies to individual operations or the whole request.
-- HTTPS verifies certificates by default.
-- Redirect behavior and credential handling are documented.
-- Retries are explicit, especially when a request can change server state.
-- Proxy and environment behavior are visible choices.
-- Error responses remain inspectable when status checking raises.
+## Roadmap
 
-### Extensions
+Done in-tree today:
 
-Keep integrations optional and ordinary. An extension should solve a specific
-problem, declare its dependencies, and compose with the core through a small,
-documented boundary. Add boundaries when real use cases justify them.
+- [x] Single-module stdlib client
+- [x] GET/POST/… + JSON + form/`data`
+- [x] Finite timeout + TLS verify
+- [x] Redirects with safe credential handling
+- [x] MIT license + `pyproject.toml`
 
-### What this is not
+Next:
 
-- A drop-in Requests clone.
-- HTTPX with different branding.
-- A microservice framework.
-- A place to hide magic globals.
-
-## Roadmap (v0)
-
-- [ ] Agree on the examples and response/error contract.
-- [ ] Choose the sync/async story, engine, and supported Python versions.
-- [ ] Design streaming and cancellation behavior; define what ships in v0.
-- [ ] Choose distribution and import names; verify PyPI availability.
-- [ ] Package the single module with `pyproject.toml` and discoverable inline types.
-- [ ] GET/POST, JSON, and finite timeouts.
-- [ ] Session with explicit configuration, reuse, and cleanup.
-- [ ] Small local tests: a 200, JSON, an HTTP error, a timeout, and cleanup.
-- [ ] Settle the license: MIT or Apache-2.0.
-- [ ] Publish a usable first release with real install and copy-in instructions.
-
-## Name
-
-The public package and import names are **TBD**. PyPI already has projects named
-[`fetch`](https://pypi.org/project/fetch/),
-[`fetchy`](https://pypi.org/project/fetchy/),
-[`wire`](https://pypi.org/project/wire/), and
-[`ask`](https://pypi.org/project/ask/) (checked September 14, 2026).
-
-The local file can still feel like `fetch.py`; the published name needs its own
-identity. Examples use `fetchy` only as a placeholder, not as an installation
-instruction.
+- [ ] Tests (200, JSON, HTTP error, timeout)
+- [ ] Decide public story for PyPI vs copy-in
+- [ ] Optional `Session` (connection reuse) — only if it stays small
+- [ ] Streaming / async — only with a coherent design, not a bolt-on
 
 ## License
 
-TBD: MIT or Apache-2.0.
+MIT — see `LICENSE`.
 
 ## Credits
 
