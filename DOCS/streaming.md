@@ -112,8 +112,9 @@ always release the body. Application exceptions inside `with` propagate intact.
 
 ## Engine and checks
 
-Buffered and streaming calls share request preparation, redirects, cookies,
-status rules, and the session transport. Incremental reads use `http.client`'s
+Buffered and streaming calls share one body reader, along with request preparation,
+redirects, cookies, status rules, and the session transport. Buffered calls collect
+that reader's output into a `Response`. Incremental reads use `http.client`'s
 `read1()`; a small reader also detects premature EOF for fixed-length bodies.
 Gzip decoding uses the standard library with bounded output and supports
 concatenated members and checksum validation. Headers retain their received

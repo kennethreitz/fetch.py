@@ -323,7 +323,8 @@ class FetchTests(unittest.TestCase):
         raw.headers = Message()
         raw.headers["Location"] = self.base
         raw.status, raw.reason = 302, "Found"
-        raw.read.return_value = b""
+        raw.read1.return_value = b""
+        raw.length = 0
         opener = MagicMock()
         opener.open.return_value = raw
         with (

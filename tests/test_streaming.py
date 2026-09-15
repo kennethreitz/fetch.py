@@ -338,6 +338,7 @@ class StreamingTests(unittest.TestCase):
 
     def test_chunked_body_and_trailers_allow_reuse(self):
         with fetch.Session() as session:
+            self.assertEqual(session.get(self.url + "/chunked").content, b"abcdef")
             with session.stream("GET", self.url + "/chunked") as response:
                 self.assertEqual(b"".join(response.iter_bytes(2)), b"abcdef")
             self.assertEqual(session.get(self.url).json()["connection"], 1)
@@ -357,6 +358,9 @@ class StreamingTests(unittest.TestCase):
                 self.assertTrue(response.closed)
                 self.assertFalse(response.consumed)
                 self.assertEqual(session.get(self.url).json()["connection"], before + 2)
+                with self.assertRaises(error):
+                    session.get(self.url + path)
+                self.assertEqual(session.get(self.url).json()["connection"], before + 3)
 
     def test_timeout_during_iteration_releases_connection(self):
         with fetch.Session(timeout=0.05) as session:
@@ -381,6 +385,7 @@ class StreamingTests(unittest.TestCase):
             ):
                 self.assertEqual(b"".join(response.iter_bytes(3)), expected)
                 self.assertTrue(response.consumed)
+                self.assertEqual(fetch.request(method, self.url + path).content, expected)
 
     def test_gzip_download_does_not_buffer_expanded_body(self):
         with fetch.stream("GET", self.url + "/large-gzip") as response:

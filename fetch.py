@@ -188,7 +188,7 @@ class _BodyReader(io.RawIOBase):
     """Bound reads without waiting for a full chunk; enforce Content-Length."""
 
     def __init__(self, raw: Any, limit: int) -> None:
-        self.raw, self.limit, self.pending = raw, limit, b""
+        self.raw, self.limit = raw, limit
         self.gzip = False
 
     def read(self, size: int = -1) -> bytes:
@@ -208,9 +208,6 @@ class _BodyReader(io.RawIOBase):
         size = self.limit if size < 0 else min(size, self.limit)
         if size == 0:
             return b""
-        if self.pending:
-            data, self.pending = self.pending[:size], self.pending[size:]
-            return data
         data = self.raw.read1(size)
         # Unlike read(), HTTPResponse.read1() permits premature EOF for a
         # fixed-length body. Never mistake that for successful consumption.
@@ -280,15 +277,8 @@ class StreamResponse:
         reader = _BodyReader(self._raw, chunk_size)
         decoder: gzip.GzipFile | None = None
         try:
-            if self.closed:
-                raise RuntimeError("Stream is closed")
-            reader.pending = reader.read(chunk_size)
-            # Empty bodies (including HEAD/204/304) need no gzip decoding.
-            if (
-                reader.pending
-                and self.headers.get("content-encoding", "").lower().strip() == "gzip"
-            ):
-                reader.gzip = True
+            reader.gzip = self.headers.get("content-encoding", "").lower().strip() == "gzip"
+            if reader.gzip:
                 decoder = gzip.GzipFile(fileobj=reader, mode="rb")
             while True:
                 if self.closed:
@@ -724,30 +714,6 @@ def _open(
 
 
 @contextmanager
-def _response(
-    raw: Any, url: str, streaming: bool, discard: Callable[[Any], None]
-) -> Iterator[Response | StreamResponse]:
-    """Own a streamed body or buffer it before handing it to the caller."""
-    if streaming:
-        with closing(StreamResponse(raw, url, discard)) as response:
-            yield response
-        return
-
-    headers = Headers(raw.headers.raw_items())
-    try:
-        content = raw.read()
-    except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
-        raise _network_error(exc, url) from exc
-    # Empty bodies (including HEAD/204/304) need no gzip decoding.
-    if content and headers.get("content-encoding", "").lower().strip() == "gzip":
-        try:
-            content = gzip.decompress(content)
-        except (OSError, EOFError, zlib.error) as exc:
-            raise DecodeError("Response is not valid gzip") from exc
-    yield Response(int(raw.status), headers, content, url, raw.reason)
-
-
-@contextmanager
 def _request(
     opener: urllib.request.OpenerDirector,
     method: str,
@@ -853,7 +819,8 @@ def _request(
             with _open(opener, req, timeout) as raw:
                 # Keep the received status even if buffering the body fails.
                 status = int(raw.status)
-                with _response(raw, url, streaming, discard) as response:
+                with closing(StreamResponse(raw, url, discard)) as live:
+                    response = live if streaming else live.read()
                     location = response.headers.get("location")
                     if follow_redirects and status in _REDIRECTS and location:
                         if hop == max_redirects:
