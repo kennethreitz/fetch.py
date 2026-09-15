@@ -352,14 +352,18 @@ class StreamingTests(unittest.TestCase):
             ("/crc-gzip", fetch.DecodeError),
         ):
             with self.subTest(path=path), fetch.Session() as session:
+                other = self.url.replace("127.0.0.1", "localhost")
+                first = session.get(other).json()["connection"]
                 before = self.server.accepted
                 with self.assertRaises(error), session.stream("GET", self.url + path) as response:
                     list(response.iter_bytes(2))
                 self.assertTrue(response.closed)
                 self.assertFalse(response.consumed)
+                self.assertEqual(session.get(other).json()["connection"], first)
                 self.assertEqual(session.get(self.url).json()["connection"], before + 2)
                 with self.assertRaises(error):
                     session.get(self.url + path)
+                self.assertEqual(session.get(other).json()["connection"], first)
                 self.assertEqual(session.get(self.url).json()["connection"], before + 3)
 
     def test_timeout_during_iteration_releases_connection(self):

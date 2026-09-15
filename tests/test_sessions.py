@@ -1,5 +1,6 @@
 """Session contracts, including real socket reuse and failure recovery."""
 
+import http.cookiejar
 import json
 import shutil
 import socket
@@ -252,11 +253,48 @@ class SessionTests(unittest.TestCase):
 
     def test_failed_post_is_never_replayed(self):
         with fetch.Session() as session:
+            other = self.servers[1].url
+            first = session.get(other).json()["connection"]
             session.get(self.url)
             with self.assertRaises(fetch.RequestError):
                 session.post(self.url + "/drop", json={"charge": 1})
             self.assertEqual(self.server.dropped, 1)
+            self.assertEqual(session.get(other).json()["connection"], first)
             self.assertEqual(session.get(self.url).json()["connection"], 2)
+
+    def test_invalid_request_preserves_cached_connections(self):
+        with fetch.Session() as session:
+            urls = [server.url for server in self.servers]
+            first = [session.get(url).json()["connection"] for url in urls]
+            for options in ({"timeout": 0}, {"data": object()}, {"json": float("nan")}):
+                with self.subTest(options=options):
+                    with self.assertRaises((ValueError, TypeError)):
+                        session.get(self.url, **options)
+                    self.assertEqual([session.get(url).json()["connection"] for url in urls], first)
+
+    def test_cookie_policy_failures_release_only_the_affected_connection(self):
+        policy = http.cookiejar.DefaultCookiePolicy()
+        error = RuntimeError("cookie policy failed")
+        other = self.servers[1].url
+        url = self.url + "/?cookie=flavor%3Dpunk"
+        with fetch.Session() as session:
+            session.cookies.set_policy(policy)
+            first = session.get(url).json()["connection"]
+            second = session.get(other).json()["connection"]
+            with patch.object(policy, "return_ok", side_effect=error):
+                with self.assertRaises(RuntimeError) as caught:
+                    session.get(self.url)
+            self.assertIs(caught.exception, error)
+            self.assertEqual(session.get(self.url).json()["connection"], first)
+            self.assertEqual(session.get(other).json()["connection"], second)
+
+            with patch.object(policy, "set_ok", side_effect=error):
+                with self.assertRaises(RuntimeError) as caught:
+                    session.get(url)
+            self.assertIs(caught.exception, error)
+            self.assertTrue(self.server.finished[first].wait(1))
+            self.assertEqual(session.get(other).json()["connection"], second)
+            self.assertEqual(session.get(self.url).json()["connection"], first + 1)
 
     def test_module_calls_are_short_lived(self):
         fetch.get(self.url + "/?cookie=a%3D1")

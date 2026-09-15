@@ -435,7 +435,6 @@ class Session:
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler(None if trust_env else {}),
             self._transport,
-            urllib.request.HTTPCookieProcessor(self.cookies),
             _ReturnResponse(),
         )
         self._closed = False
@@ -519,6 +518,7 @@ class Session:
                 self._opener,
                 method,
                 url,
+                cookies=self.cookies,
                 streaming=streaming,
                 discard=self._transport.discard,
                 params=params,
@@ -535,13 +535,6 @@ class Session:
                 if isinstance(response, StreamResponse):
                     self._stream_response = response
                 yield response
-        except BaseException as exc:
-            if self._stream_response is None and not isinstance(exc, HTTPError):
-                # Before delivery, a failure may leave an uncertain connection.
-                # Delivered streams close/discard their own body, so unrelated
-                # cached connections survive caller errors and early exits.
-                self._transport.close()
-            raise
         finally:
             self._active = False
             self._stream_response = None
@@ -719,6 +712,7 @@ def _request(
     method: str,
     url: str,
     *,
+    cookies: http.cookiejar.CookieJar,
     streaming: bool,
     discard: Callable[[Any], None],
     params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None,
@@ -816,10 +810,12 @@ def _request(
         for hop in range(max_redirects + 1):
             status = None
             req = urllib.request.Request(url, data=body, headers=outgoing, method=method)
+            cookies.add_cookie_header(req)
             with _open(opener, req, timeout) as raw:
                 # Keep the received status even if buffering the body fails.
                 status = int(raw.status)
                 with closing(StreamResponse(raw, url, discard)) as live:
+                    cookies.extract_cookies(raw, req)
                     response = live if streaming else live.read()
                     location = response.headers.get("location")
                     if follow_redirects and status in _REDIRECTS and location:

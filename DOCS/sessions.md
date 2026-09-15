@@ -73,7 +73,8 @@ urllib's existing transport and are closed after each response.
 
 Buffered bodies are fully consumed before returning a response or raising `HTTPError`.
 That makes reuse safe even after a 404. A transport or body-decoding failure
-discards the failed connection; the session can make a fresh request afterward.
+discards only the failed connection; cached connections to other servers remain
+available. Invalid request arguments leave existing connections alone.
 No failed request is automatically replayed. A server silently closing an idle
 connection can therefore cause the next request to raise `RequestError`.
 
@@ -98,10 +99,12 @@ with later calls.
 
 ## Engine and cost
 
-The existing urllib request pipeline still handles proxy routing and cookie
-processing. A small handler uses `http.client` directly for persistent direct
-connections, with a bounded dictionary for eviction. This keeps the single-file
-contract and avoids a second request engine. It also means proxy pooling,
+The urllib request pipeline handles proxy routing. Each request applies the
+standard-library cookie jar before sending and inside response cleanup, so even
+a failing custom cookie policy releases the affected response. A small handler
+uses `http.client` for persistent direct connections, with a bounded dictionary
+for eviction. This keeps the single-file contract and avoids a second request
+engine. It also means proxy pooling,
 concurrent sharing, streaming uploads, retries, and HTTP/2 remain outside this API.
 Python documents the underlying [connection lifecycle](https://docs.python.org/3/library/http.client.html#http.client.HTTPConnection.getresponse)
 and [cookie policy](https://docs.python.org/3/library/http.cookiejar.html).
