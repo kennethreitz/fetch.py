@@ -1,8 +1,9 @@
 # fetch.py
 
-> Requests energy for when the dependency is the problem.
+**HTTP you can keep in your pocket.**
 
-One readable Python file. No dependencies. HTTP you can keep in your pocket.
+A small, humane HTTP client. One readable Python file. Zero runtime dependencies.
+Copy it into your project, understand the whole thing, and make it yours.
 
 ```python
 import fetch
@@ -10,8 +11,11 @@ import fetch
 data = fetch.get("https://httpbin.org/get", params={"q": "punk"}).json()
 ```
 
-Copy `fetch.py` into your project, or install the package. Timeouts and TLS
-verification are on. HTTP/1.1, synchronous, Python 3.11+.
+Typed responses. Finite timeouts. Verified TLS.\
+Python 3.11+ · HTTP/1.1 · synchronous.
+
+> **Under active development.** The API is still taking shape. Follow the
+> ideas and design decisions in [`DOCS/`](DOCS/README.md).
 
 ## Why
 
