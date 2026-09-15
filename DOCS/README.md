@@ -15,6 +15,7 @@ unless a note explicitly identifies them as current behavior. The main
 | [Pydantic](pydantic.md) | How should typed validation compose with a response? |
 | [Logging](logging.md) | How can callers see what happened without configuring another system? |
 | [Single file](single-file.md) | What does copying the library into a project promise? |
+| [Sessions](sessions.md) | Who owns shared defaults, cookies, and open connections? |
 
 ## Adding a topic
 

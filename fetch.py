@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import gzip
 import http.client
+import http.cookiejar
 import json as _json
 import logging
 import math
@@ -45,7 +46,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from email.message import Message
 from functools import partial
-from typing import Any, TypeVar
+from typing import Any, Self, TypedDict, TypeVar, Unpack
 
 __version__ = "0.1.0"
 __all__ = [
@@ -56,6 +57,7 @@ __all__ = [
     "RedirectError",
     "RequestError",
     "Response",
+    "Session",
     "Timeout",
     "delete",
     "get",
@@ -187,6 +189,204 @@ class _ReturnResponse(urllib.request.HTTPErrorProcessor):
     https_response = http_response
 
 
+class _SessionTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    """Reuse direct connections; leave proxy handling to urllib."""
+
+    def __init__(self, context: ssl.SSLContext | None, max_connections: int) -> None:
+        urllib.request.HTTPSHandler.__init__(self, context=context)
+        self.connections: dict[tuple[str, str], http.client.HTTPConnection] = {}
+        self.max_connections = max_connections
+
+    def close(self) -> None:
+        for connection in self.connections.values():
+            connection.close()
+        self.connections.clear()
+
+    def do_open(self, http_class: Any, req: Any, **kwargs: Any) -> Any:
+        if req.has_proxy() or req._tunnel_host:
+            return super().do_open(http_class, req, **kwargs)
+        key = (req.type, req.host)
+        connection = self.connections.pop(key, None)
+        if connection is None:
+            connection = http_class(req.host, timeout=req.timeout, **kwargs)
+        headers = {name.title(): value for name, value in req.header_items()}
+        try:
+            connection.timeout = req.timeout
+            if connection.sock is not None:
+                connection.sock.settimeout(req.timeout)
+            connection.request(req.get_method(), req.selector, req.data, headers)
+            response = connection.getresponse()
+        except BaseException:
+            connection.close()
+            raise
+        reusable = (
+            not response.will_close
+            and "close"
+            not in {token.strip() for token in headers.get("Connection", "").lower().split(",")}
+            and response.status != 101
+            and not (req.get_method() == "CONNECT" and 200 <= response.status < 300)
+        )
+        if reusable:
+            self.connections[key] = connection
+            if len(self.connections) > self.max_connections:
+                self.connections.pop(next(iter(self.connections))).close()
+        elif connection.sock is not None:
+            # The response's file object owns the pending body. Closing this
+            # socket reference lets it finish reading without retaining it.
+            connection.sock.close()
+            connection.sock = None
+        response.url = req.full_url
+        response.msg = response.reason
+        return response
+
+
+class _SessionOptions(TypedDict, total=False):
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None
+    headers: Mapping[str, str | None] | None
+    json: Any
+    data: bytes | str | Mapping[str, Any] | None
+    timeout: float | None
+    follow_redirects: bool | None
+    max_redirects: int | None
+    check_status: bool | None
+
+
+class Session:
+    """Shared defaults, cookies, and direct HTTP connection reuse.
+
+    Use as a context manager or call close(). One session is for sequential
+    use; use separate sessions for concurrent work. Proxy connections are not
+    cached. A closed session cannot be reused, and failures are never retried.
+    """
+
+    def __init__(
+        self,
+        *,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = 30.0,
+        follow_redirects: bool = True,
+        max_redirects: int = 10,
+        check_status: bool = True,
+        trust_env: bool = False,
+        context: ssl.SSLContext | None = None,
+        max_connections: int = 8,
+    ) -> None:
+        _validate_limits(timeout, max_redirects)
+        if (
+            isinstance(max_connections, bool)
+            or not isinstance(max_connections, int)
+            or max_connections < 1
+        ):
+            raise ValueError("max_connections must be a positive integer")
+        self.headers = _headers(headers)
+        self.timeout = timeout
+        self.follow_redirects = follow_redirects
+        self.max_redirects = max_redirects
+        self.check_status = check_status
+        self.cookies = http.cookiejar.CookieJar(
+            http.cookiejar.DefaultCookiePolicy(
+                strict_ns_domain=http.cookiejar.DefaultCookiePolicy.DomainStrictNonDomain
+            )
+        )
+        self._transport = _SessionTransport(context, max_connections)
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler(None if trust_env else {}),
+            self._transport,
+            urllib.request.HTTPCookieProcessor(self.cookies),
+            _ReturnResponse(),
+        )
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        self._transport.close()
+        self._closed = True
+
+    def __enter__(self) -> Self:
+        if self.closed:
+            raise RuntimeError("Session is closed")
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+        headers: Mapping[str, str | None] | None = None,
+        json: Any = _UNSET,
+        data: bytes | str | Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        follow_redirects: bool | None = None,
+        max_redirects: int | None = None,
+        check_status: bool | None = None,
+    ) -> Response:
+        """Send using session defaults; None options inherit those defaults.
+
+        Headers merge case-insensitively. A None header removes a session
+        header for this call; built-in transport defaults may still apply.
+        TLS context and proxy discovery are fixed when the session is created.
+        """
+        if self.closed:
+            raise RuntimeError("Session is closed")
+        outgoing = _headers(self.headers)
+        for name, value in (headers or {}).items():
+            _headers({name: "" if value is None else value})
+            if value is None:
+                outgoing.pop(name.lower(), None)
+            else:
+                outgoing[name.lower()] = value
+        try:
+            return _request(
+                self._opener,
+                method,
+                url,
+                params=params,
+                headers=outgoing,
+                json=json,
+                data=data,
+                timeout=self.timeout if timeout is None else timeout,
+                follow_redirects=self.follow_redirects
+                if follow_redirects is None
+                else follow_redirects,
+                max_redirects=self.max_redirects if max_redirects is None else max_redirects,
+                check_status=self.check_status if check_status is None else check_status,
+            )
+        except BaseException as exc:
+            if not isinstance(exc, HTTPError):
+                # Reading may have failed halfway through a response. Never
+                # return an uncertain connection to the cache or replay a call.
+                self._transport.close()
+            raise
+
+    def get(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("POST", url, **kwargs)
+
+    def put(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("PUT", url, **kwargs)
+
+    def patch(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("PATCH", url, **kwargs)
+
+    def delete(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("DELETE", url, **kwargs)
+
+    def head(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("HEAD", url, **kwargs)
+
+    def options(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        return self.request("OPTIONS", url, **kwargs)
+
+
 def _url(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("url must be a string")
@@ -237,6 +437,18 @@ def _headers(values: Mapping[str, str] | None) -> dict[str, str]:
     return result
 
 
+def _validate_limits(timeout: float, max_redirects: int) -> None:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
+        raise ValueError("timeout must be a finite positive number of seconds")
+    if isinstance(max_redirects, bool) or not isinstance(max_redirects, int) or max_redirects < 0:
+        raise ValueError("max_redirects must be a nonnegative integer")
+
+
 def request(
     method: str,
     url: str,
@@ -252,6 +464,38 @@ def request(
     trust_env: bool = False,
     context: ssl.SSLContext | None = None,
 ) -> Response:
+    """Send one request using a temporary session; no state survives the call.
+
+    HTTP 4xx/5xx raise unless check_status=False. timeout limits individual
+    socket operations. See Session.request for body, query, and header options.
+    trust_env opts into urllib's environment/system proxy discovery.
+    context supplies a custom TLS context, e.g. for a private certificate CA.
+    """
+    with Session(
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+    ) as session:
+        return session.request(method, url, params=params, headers=headers, json=json, data=data)
+
+
+def _request(
+    opener: urllib.request.OpenerDirector,
+    method: str,
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None,
+    headers: Mapping[str, str],
+    json: Any,
+    data: bytes | str | Mapping[str, Any] | None,
+    timeout: float,
+    follow_redirects: bool,
+    max_redirects: int,
+    check_status: bool,
+) -> Response:
     """Send a request. HTTP 4xx/5xx raise HTTPError unless check_status=False.
 
     params appends query parameters; sequence values become repeated keys.
@@ -259,8 +503,6 @@ def request(
     text, or a mapping encoded as a form. json and data are mutually exclusive.
 
     timeout is a positive socket-operation timeout, not a total deadline.
-    trust_env opts into urllib's environment/system proxy discovery.
-    context supplies a custom TLS context, e.g. for a private certificate CA.
 
     Redirects preserve methods/bodies except POST on 301/302 and non-HEAD
     methods on 303, which become GET. Credentials are stripped when origins
@@ -269,15 +511,7 @@ def request(
     if not isinstance(method, str) or not _TOKEN.fullmatch(method):
         raise ValueError("method must be an HTTP token")
     method = method.upper()
-    if (
-        isinstance(timeout, bool)
-        or not isinstance(timeout, (int, float))
-        or not math.isfinite(timeout)
-        or timeout <= 0
-    ):
-        raise ValueError("timeout must be a finite positive number of seconds")
-    if isinstance(max_redirects, bool) or not isinstance(max_redirects, int) or max_redirects < 0:
-        raise ValueError("max_redirects must be a nonnegative integer")
+    _validate_limits(timeout, max_redirects)
     if json is not _UNSET and data is not None:
         raise ValueError("Use either json or data, not both")
     url = _url(url)
@@ -306,11 +540,6 @@ def request(
     elif data is not None:
         raise TypeError("data must be bytes, str, or a mapping")
 
-    opener = urllib.request.build_opener(
-        urllib.request.ProxyHandler(None if trust_env else {}),
-        urllib.request.HTTPSHandler(context=context),
-        _ReturnResponse(),
-    )
     started = time.perf_counter()
     status: int | None = None
     hop = 0

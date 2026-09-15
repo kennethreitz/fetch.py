@@ -70,6 +70,9 @@ response = fetch.get(sys.argv[2], timeout=2)
 assert response.parse(json.loads) == {"portable": True}
 assert [r.fetch_event for r in records] == ["request.started", "request.completed"]
 assert all(r.name == sys.argv[1] for r in records)
+with fetch.Session(timeout=2) as session:
+    assert session.get(sys.argv[2]).parse(json.loads) == {"portable": True}
+assert session.closed
 print(json.dumps({"status": response.status, "version": fetch.__version__}))
 """
                 env = {

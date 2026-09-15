@@ -29,10 +29,8 @@ Use **fetch.py** when the *dependency* is the problem:
   Understand the implementation as easily as the call site.
 - **Control** — teach HTTP, change behavior, and keep the pieces you need.
 
-The current scope is synchronous HTTP/1.1 with buffered responses.
-[Requests](https://requests.readthedocs.io/) provides sessions and connection
-pooling. [HTTPX](https://www.python-httpx.org/) also supports async, with
-[optional HTTP/2](https://www.python-httpx.org/http2/).
+The current scope is synchronous HTTP/1.1 with buffered responses, reusable
+sessions, and cookies. Async, streaming, and HTTP/2 remain outside this prototype.
 
 ## Install
 
@@ -75,9 +73,33 @@ r.raise_for_status()  # -> fetch.HTTPError
 Verbs: `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, plus
 `request(method, url, ...)`.
 
+## Sessions
+
+Keep defaults, cookies, and connections across requests:
+
+```python
+with fetch.Session(headers={"User-Agent": "my-app/1.0"}, timeout=5) as s:
+    profile = s.get("https://api.example.com/me").json()
+    s.post("https://api.example.com/events", json={"event": "hello"}, timeout=10)
+```
+
+A session has the same verbs as the module. Per-request options override its
+defaults; headers merge case-insensitively. Pass a header value of `None` to
+remove a session header for that call. Cookies follow domain, path, and Secure
+rules; `s.cookies` is a standard-library `CookieJar` (`s.cookies.clear()` to reset).
+
+Use `with`, or call `s.close()` when finished. Responses stay usable after closing;
+a closed session cannot make more requests. Each session is for sequential use.
+
+Direct HTTP/HTTPS connections are reused, with at most eight origins cached
+(`max_connections=8`). Proxy connections are not reused. There are no automatic
+retries, including when a server has silently closed an idle connection.
+Module calls such as `fetch.get()` use a temporary session and keep no state
+between calls. See [Sessions](DOCS/sessions.md) for the full contract.
+
 ## Response
 
-`Response` is fully buffered — no open socket, no `close()`.
+`Response` is fully buffered and owns no socket, so it needs no `close()`.
 
 | Attribute / method | Meaning |
 | --- | --- |
@@ -151,7 +173,7 @@ Invalid arguments fail fast. Network and HTTP failures use the hierarchy above.
 - **Proxies / env:** off unless `trust_env=True`.
 - **Body:** `json=` and `data=` are mutually exclusive; `Content-Length` is
   calculated for you.
-- **No retries.** No streaming API yet. No `Session` yet.
+- **No retries.** No streaming API yet.
 
 ## Request signature (abridged)
 
@@ -189,11 +211,11 @@ Implemented in the current prototype:
 - [x] Generic typed parsing and structured debug logging
 - [x] Local HTTP tests, copied-file checks, and optional Pydantic integration
 - [x] Typed wheel built from the canonical source file
+- [x] Sessions with shared defaults, cookies, and direct connection reuse
 
 Next:
 
 - [ ] Decide public story for PyPI vs copy-in
-- [ ] Optional `Session` (connection reuse) — only if it stays small
 - [ ] Streaming / async — only with a coherent design, not a bolt-on
 
 ## Design notes
@@ -203,6 +225,7 @@ API ideas live in [`DOCS/`](DOCS/README.md) before they become features:
 - [Pydantic](DOCS/pydantic.md) — validating responses and sending models.
 - [Logging](DOCS/logging.md) — useful diagnostics through standard logging.
 - [Single file](DOCS/single-file.md) — the copy-in contract and its tradeoffs.
+- [Sessions](DOCS/sessions.md) — defaults, cookies, connection reuse, and cleanup.
 
 The notes distinguish current behavior from proposals and open questions.
 
