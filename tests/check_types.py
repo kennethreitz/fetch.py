@@ -3,6 +3,7 @@
 Run with mypy or Pyright in an environment containing Pydantic.
 """
 
+from collections.abc import Iterator
 from typing import assert_type
 
 from pydantic import BaseModel, TypeAdapter
@@ -27,3 +28,9 @@ def check(response: fetch.Response) -> None:
         assert_type(session.post("https://example.com", json={"name": "Jo"}), fetch.Response)
         assert_type(session.request("GET", "https://example.com"), fetch.Response)
         assert_type(session.get("https://example.com").parse(User.model_validate_json), User)
+        with session.stream("GET", "https://example.com", timeout=2) as stream:
+            assert_type(stream, fetch.StreamResponse)
+            assert_type(stream.iter_bytes(), Iterator[bytes])
+    with fetch.stream("GET", "https://example.com") as stream:
+        assert_type(stream.read(), fetch.Response)
+        assert_type(stream.read().parse(User.model_validate_json), User)

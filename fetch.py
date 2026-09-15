@@ -4,7 +4,7 @@
     data = fetch.get("https://example.com/api").json()
 
 Copy this file into your project. Timeouts and TLS verification are on;
-HTTP errors raise by default. Responses are buffered. HTTP/1.1, synchronous.
+HTTP errors raise by default. Buffer by default, stream explicitly. HTTP/1.1, synchronous.
 SPDX-License-Identifier: MIT
 Copyright (c) 2026 Kenneth Reitz
 
@@ -32,6 +32,7 @@ from __future__ import annotations
 import gzip
 import http.client
 import http.cookiejar
+import io
 import json as _json
 import logging
 import math
@@ -43,10 +44,11 @@ import urllib.parse
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from email.message import Message
 from functools import partial
-from typing import Any, Self, TypedDict, TypeVar, Unpack
+from typing import Any, Self, TypedDict, TypeVar, Unpack, cast
 
 __version__ = "0.1.0"
 __all__ = [
@@ -58,6 +60,7 @@ __all__ = [
     "RequestError",
     "Response",
     "Session",
+    "StreamResponse",
     "Timeout",
     "delete",
     "get",
@@ -67,6 +70,7 @@ __all__ = [
     "post",
     "put",
     "request",
+    "stream",
 ]
 
 _UNSET = object()
@@ -120,9 +124,9 @@ class DecodeError(Error):
 
 
 class HTTPError(Error):
-    """An HTTP failure, with the complete response available as .response."""
+    """An HTTP failure; .response is buffered or streaming to match the call."""
 
-    def __init__(self, response: Response) -> None:
+    def __init__(self, response: Response | StreamResponse) -> None:
         self.response = response
         super().__init__(f"{response.status} {response.reason} for {response.url}")
 
@@ -180,6 +184,147 @@ class Response:
         return self
 
 
+class _BodyReader(io.RawIOBase):
+    """Bound reads without waiting for a full chunk; enforce Content-Length."""
+
+    def __init__(self, raw: Any, limit: int) -> None:
+        self.raw, self.limit, self.pending = raw, limit, b""
+        self.gzip = False
+
+    def read(self, size: int = -1) -> bytes:
+        # Gzip's magic-number probe expects exactly two bytes. Its other
+        # header reads handle short reads; body reads must stay incremental.
+        if self.gzip and size == 2:
+            data = self._read_once(2)
+            while data and len(data) < 2:
+                more = self._read_once(2 - len(data))
+                if not more:
+                    break
+                data += more
+            return data
+        return self._read_once(size)
+
+    def _read_once(self, size: int) -> bytes:
+        size = self.limit if size < 0 else min(size, self.limit)
+        if size == 0:
+            return b""
+        if self.pending:
+            data, self.pending = self.pending[:size], self.pending[size:]
+            return data
+        data = self.raw.read1(size)
+        # Unlike read(), HTTPResponse.read1() permits premature EOF for a
+        # fixed-length body. Never mistake that for successful consumption.
+        if not data and self.raw.length not in (None, 0):
+            raise http.client.IncompleteRead(b"", self.raw.length)
+        return data
+
+
+class StreamResponse:
+    """A one-shot body owned by a stream context. Metadata never reads the body.
+
+    iter_bytes() yields decoded bytes; read() explicitly buffers a Response.
+    Closing before successful exhaustion discards the underlying connection.
+    """
+
+    def __init__(self, raw: Any, url: str, discard: Callable[[Any], None]) -> None:
+        self.status, self.reason, self.url = int(raw.status), raw.reason, url
+        self.headers = Headers(raw.headers.raw_items())
+        self._raw, self._discard = raw, discard
+        self._closed = self._started = self._consumed = False
+        self._buffered: Response | None = None
+        self._error: BaseException | None = None
+
+    def __repr__(self) -> str:
+        return f"<StreamResponse [{self.status}]>"
+
+    @property
+    def ok(self) -> bool:
+        return 200 <= self.status < 300
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def consumed(self) -> bool:
+        return self._consumed
+
+    def raise_for_status(self) -> Self:
+        if self.status >= 400:
+            raise HTTPError(self)
+        return self
+
+    def close(self) -> None:
+        if not self.closed:
+            self._closed = True
+            try:
+                self._raw.close()
+            finally:
+                if not self.consumed:
+                    self._discard(self._raw)
+
+    def iter_bytes(self, chunk_size: int = 65536) -> Iterator[bytes]:
+        """Consume once, yielding up to chunk_size decoded bytes at a time.
+
+        Chunks may be smaller and do not represent application messages.
+        Gzip is decoded incrementally, including checksum validation at EOF.
+        """
+        if isinstance(chunk_size, bool) or not isinstance(chunk_size, int) or chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer")
+        if self.closed or self._started:
+            raise RuntimeError("Stream is closed or its body has already been claimed")
+        self._started = True
+        return self._iter_bytes(chunk_size)
+
+    def _iter_bytes(self, chunk_size: int) -> Iterator[bytes]:
+        reader = _BodyReader(self._raw, chunk_size)
+        decoder: gzip.GzipFile | None = None
+        try:
+            if self.closed:
+                raise RuntimeError("Stream is closed")
+            reader.pending = reader.read(chunk_size)
+            # Empty bodies (including HEAD/204/304) need no gzip decoding.
+            if (
+                reader.pending
+                and self.headers.get("content-encoding", "").lower().strip() == "gzip"
+            ):
+                reader.gzip = True
+                decoder = gzip.GzipFile(fileobj=reader, mode="rb")
+            while True:
+                if self.closed:
+                    raise RuntimeError("Stream is closed")
+                try:
+                    data = decoder.read1(chunk_size) if decoder else reader.read(chunk_size)
+                except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+                    raise DecodeError("Response is not valid gzip") from exc
+                if not data:
+                    self._consumed = True
+                    break
+                yield data
+        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+            error = _network_error(exc, self.url)
+            self._error = error
+            raise error from exc
+        except BaseException as exc:
+            if not isinstance(exc, GeneratorExit):
+                self._error = exc
+            raise
+        finally:
+            if decoder:
+                decoder.close()
+            self.close()
+
+    def read(self) -> Response:
+        """Buffer an unread body; repeated calls return the same Response.
+
+        After starting iter_bytes(), read() cannot recover already yielded bytes.
+        """
+        if self._buffered is None:
+            content = b"".join(self.iter_bytes())
+            self._buffered = Response(self.status, self.headers, content, self.url, self.reason)
+        return self._buffered
+
+
 class _ReturnResponse(urllib.request.HTTPErrorProcessor):
     # urllib normally turns errors into exceptions and follows redirects itself.
     # Keep both decisions here so all verbs and all statuses behave consistently.
@@ -202,6 +347,13 @@ class _SessionTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
             connection.close()
         self.connections.clear()
 
+    def discard(self, response: Any) -> None:
+        connection = getattr(response, "_fetch_connection", None)
+        for key, cached in list(self.connections.items()):
+            if cached is connection:
+                del self.connections[key]
+                cached.close()
+
     def do_open(self, http_class: Any, req: Any, **kwargs: Any) -> Any:
         if req.has_proxy() or req._tunnel_host:
             return super().do_open(http_class, req, **kwargs)
@@ -215,7 +367,7 @@ class _SessionTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
             if connection.sock is not None:
                 connection.sock.settimeout(req.timeout)
             connection.request(req.get_method(), req.selector, req.data, headers)
-            response = connection.getresponse()
+            response: Any = connection.getresponse()
         except BaseException:
             connection.close()
             raise
@@ -237,6 +389,7 @@ class _SessionTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
             connection.sock = None
         response.url = req.full_url
         response.msg = response.reason
+        response._fetch_connection = connection
         return response
 
 
@@ -296,12 +449,16 @@ class Session:
             _ReturnResponse(),
         )
         self._closed = False
+        self._active = False
+        self._stream_response: StreamResponse | None = None
 
     @property
     def closed(self) -> bool:
         return self._closed
 
     def close(self) -> None:
+        if self._stream_response is not None:
+            self._stream_response.close()
         self._transport.close()
         self._closed = True
 
@@ -313,11 +470,33 @@ class Session:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def request(
+    def request(self, method: str, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a buffered request, overriding session defaults for this call."""
+        with self._send(method, url, streaming=False, **kwargs) as response:
+            assert isinstance(response, Response)
+            return response
+
+    @contextmanager
+    def stream(
+        self, method: str, url: str, **kwargs: Unpack[_SessionOptions]
+    ) -> Iterator[StreamResponse]:
+        """Open a body inside a with block; exit closes any unread remainder.
+
+        HTTP errors raise on entry, with a closed StreamResponse as .response.
+        Set check_status=False to inspect or read an error body yourself.
+        Exit this context before making another request through the session.
+        """
+        with self._send(method, url, streaming=True, **kwargs) as response:
+            assert isinstance(response, StreamResponse)
+            yield response
+
+    @contextmanager
+    def _send(
         self,
         method: str,
         url: str,
         *,
+        streaming: bool,
         params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
         headers: Mapping[str, str | None] | None = None,
         json: Any = _UNSET,
@@ -326,7 +505,7 @@ class Session:
         follow_redirects: bool | None = None,
         max_redirects: int | None = None,
         check_status: bool | None = None,
-    ) -> Response:
+    ) -> Iterator[Response | StreamResponse]:
         """Send using session defaults; None options inherit those defaults.
 
         Headers merge case-insensitively. A None header removes a session
@@ -335,6 +514,8 @@ class Session:
         """
         if self.closed:
             raise RuntimeError("Session is closed")
+        if self._active:
+            raise RuntimeError("Exit the active stream context before making another request")
         outgoing = _headers(self.headers)
         for name, value in (headers or {}).items():
             _headers({name: "" if value is None else value})
@@ -342,11 +523,14 @@ class Session:
                 outgoing.pop(name.lower(), None)
             else:
                 outgoing[name.lower()] = value
+        self._active = True
         try:
-            return _request(
+            with _request(
                 self._opener,
                 method,
                 url,
+                streaming=streaming,
+                discard=self._transport.discard,
                 params=params,
                 headers=outgoing,
                 json=json,
@@ -357,13 +541,19 @@ class Session:
                 else follow_redirects,
                 max_redirects=self.max_redirects if max_redirects is None else max_redirects,
                 check_status=self.check_status if check_status is None else check_status,
-            )
+            ) as response:
+                if isinstance(response, StreamResponse):
+                    self._stream_response = response
+                yield response
         except BaseException as exc:
             if not isinstance(exc, HTTPError):
                 # Reading may have failed halfway through a response. Never
                 # return an uncertain connection to the cache or replay a call.
                 self._transport.close()
             raise
+        finally:
+            self._active = False
+            self._stream_response = None
 
     def get(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
         return self.request("GET", url, **kwargs)
@@ -482,11 +672,54 @@ def request(
         return session.request(method, url, params=params, headers=headers, json=json, data=data)
 
 
+@contextmanager
+def stream(
+    method: str,
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+) -> Iterator[StreamResponse]:
+    """Stream a response inside a with block, using a temporary session."""
+    with (
+        Session(
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            max_redirects=max_redirects,
+            check_status=check_status,
+            trust_env=trust_env,
+            context=context,
+        ) as session,
+        session.stream(
+            method, url, params=params, headers=headers, json=json, data=data
+        ) as response,
+    ):
+        yield response
+
+
+def _network_error(exc: BaseException, url: str) -> RequestError:
+    cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+    if isinstance(cause, TimeoutError):
+        return Timeout(f"Request timed out: {url}")
+    return RequestError(f"Request failed: {url}")
+
+
+@contextmanager
 def _request(
     opener: urllib.request.OpenerDirector,
     method: str,
     url: str,
     *,
+    streaming: bool,
+    discard: Callable[[Any], None],
     params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None,
     headers: Mapping[str, str],
     json: Any,
@@ -495,7 +728,7 @@ def _request(
     follow_redirects: bool,
     max_redirects: int,
     check_status: bool,
-) -> Response:
+) -> Iterator[Response | StreamResponse]:
     """Send a request. HTTP 4xx/5xx raise HTTPError unless check_status=False.
 
     params appends query parameters; sequence values become repeated keys.
@@ -517,7 +750,8 @@ def _request(
     url = _url(url)
     if params is not None:
         query = urllib.parse.urlencode(
-            params if isinstance(params, Mapping) else list(params), doseq=True
+            cast(Mapping[str, Any], params) if isinstance(params, Mapping) else list(params),
+            doseq=True,
         )
         if query:
             url += ("&" if urllib.parse.urlsplit(url).query else "?") + query
@@ -544,7 +778,7 @@ def _request(
     status: int | None = None
     hop = 0
 
-    def record(event: str, error: Exception | None = None) -> None:
+    def record(event: str, error: BaseException | None = None) -> None:
         if not _log.isEnabledFor(logging.DEBUG):
             return
         host = urllib.parse.urlsplit(url).hostname
@@ -575,6 +809,9 @@ def _request(
         )
 
     record("started")
+    response: Response | StreamResponse
+    delivered = False
+    live: StreamResponse | None = None
     try:
         for hop in range(max_redirects + 1):
             status = None
@@ -583,50 +820,73 @@ def _request(
                 with opener.open(req, timeout=timeout) as raw:
                     status, reason = int(raw.status), raw.reason
                     response_headers = Headers(raw.headers.raw_items())
-                    content = raw.read()
+                    live = StreamResponse(raw, url, discard) if streaming else None
+                    try:
+                        if live is not None:
+                            response = live
+                        else:
+                            content = raw.read()
+                            # Empty bodies need no gzip decoding.
+                            if (
+                                content
+                                and response_headers.get("content-encoding", "").lower().strip()
+                                == "gzip"
+                            ):
+                                try:
+                                    content = gzip.decompress(content)
+                                except (OSError, EOFError, zlib.error) as exc:
+                                    raise DecodeError("Response is not valid gzip") from exc
+                            response = Response(status, response_headers, content, url, reason)
+                        location = response.headers.get("location")
+                        if follow_redirects and status in _REDIRECTS and location:
+                            if hop == max_redirects:
+                                raise RedirectError(response)
+                            try:
+                                target = _url(urllib.parse.urljoin(url, location))
+                            except (ValueError, UnicodeError) as exc:
+                                raise RedirectError(response) from exc
+                            if url.startswith("https:") and target.startswith("http:"):
+                                raise RedirectError(response)
+                            record("redirect")
+                            if _origin(url) != _origin(target):
+                                for name in ("authorization", "cookie", "proxy-authorization"):
+                                    outgoing.pop(name, None)
+                            outgoing.pop("host", None)
+                            if (status in {301, 302} and method == "POST") or (
+                                status == 303 and method != "HEAD"
+                            ):
+                                method, body = "GET", None
+                                for name in list(outgoing):
+                                    if name.startswith("content-"):
+                                        del outgoing[name]
+                            url = target
+                            continue
+                        if check_status:
+                            response.raise_for_status()
+                        delivered = True
+                        yield response
+                        if live is not None and live._error is not None:
+                            record("failed", live._error)
+                        else:
+                            record(
+                                "closed" if live is not None and not live.consumed else "completed"
+                            )
+                        return
+                    finally:
+                        if live is not None:
+                            live.close()
             except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
-                cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-                if isinstance(cause, TimeoutError):
-                    raise Timeout(f"Request timed out: {url}") from exc
-                raise RequestError(f"Request failed: {url}") from exc
-            # HEAD/204/304 have no payload even if they describe compressed content.
-            if content and response_headers.get("content-encoding", "").lower().strip() == "gzip":
-                try:
-                    content = gzip.decompress(content)
-                except (OSError, EOFError, zlib.error) as exc:
-                    raise DecodeError("Response is not valid gzip") from exc
-            response = Response(status, response_headers, content, url, reason)
-            location = response.headers.get("location")
-            if follow_redirects and status in _REDIRECTS and location:
-                if hop == max_redirects:
-                    raise RedirectError(response)
-                try:
-                    target = _url(urllib.parse.urljoin(url, location))
-                except (ValueError, UnicodeError) as exc:
-                    raise RedirectError(response) from exc
-                if url.startswith("https:") and target.startswith("http:"):
-                    raise RedirectError(response)
-                record("redirect")
-                if _origin(url) != _origin(target):
-                    for name in ("authorization", "cookie", "proxy-authorization"):
-                        outgoing.pop(name, None)
-                outgoing.pop("host", None)
-                if (status in {301, 302} and method == "POST") or (
-                    status == 303 and method != "HEAD"
-                ):
-                    method, body = "GET", None
-                    for name in list(outgoing):
-                        if name.startswith("content-"):
-                            del outgoing[name]
-                url = target
-                continue
-            if check_status:
-                response.raise_for_status()
-            record("completed")
-            return response
+                if delivered:
+                    # An application's exception inside its with block is not
+                    # a transport failure. Stream reads normalize their own.
+                    raise
+                raise _network_error(exc, url) from exc
         raise AssertionError("unreachable")
-    except Exception as exc:
-        record("failed", exc)
+    except BaseException as exc:
+        if delivered and live is not None and live._error is None:
+            record("completed" if live.consumed else "closed")
+        else:
+            record("failed", exc)
         raise
 
 

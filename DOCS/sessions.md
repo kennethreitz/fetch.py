@@ -17,6 +17,9 @@ One session owns shared request defaults, a cookie jar, and a bounded set of
 direct connections. It returns the same buffered `Response` as `fetch.get()`.
 Typed parsing and logging work the same way.
 
+For a streamed response, use `with s.stream(method, url, ...) as r:` and consume
+`r.iter_bytes()`. The request options are the same. See [Streaming](streaming.md).
+
 ## Defaults and overrides
 
 The constructor accepts `headers`, `timeout=30.0`, `follow_redirects=True`,
@@ -68,9 +71,9 @@ the least recently used cached connection. Server `Connection: close`, a client
 close request, and protocol upgrades prevent reuse. Proxy connections use
 urllib's existing transport and are closed after each response.
 
-Bodies are fully consumed before returning a response or raising `HTTPError`.
+Buffered bodies are fully consumed before returning a response or raising `HTTPError`.
 That makes reuse safe even after a 404. A transport or body-decoding failure
-closes cached connections; the session can make a fresh request afterward.
+discards the failed connection; the session can make a fresh request afterward.
 No failed request is automatically replayed. A server silently closing an idle
 connection can therefore cause the next request to raise `RequestError`.
 
@@ -83,6 +86,12 @@ Responses remain usable after the session closes. There is no global session or
 background cleanup thread. Do not share a session across concurrent work;
 each worker should own its own session.
 
+An open stream reserves the session until its context exits, even after the
+body is consumed or closed. An overlapping request raises `RuntimeError`.
+Closing a session also closes its active stream. Full consumption makes the
+connection reusable; early exit discards that connection without draining the
+body. Streaming redirects discard their intermediate bodies as well.
+
 Module-level calls use a temporary session, including cookies within that call's
 redirect chain. They release connections before returning and share no state
 with later calls.
@@ -93,11 +102,12 @@ The existing urllib request pipeline still handles proxy routing and cookie
 processing. A small handler uses `http.client` directly for persistent direct
 connections, with a bounded dictionary for eviction. This keeps the single-file
 contract and avoids a second request engine. It also means proxy pooling,
-concurrent sharing, streaming, retries, and HTTP/2 remain outside this API.
+concurrent sharing, streaming uploads, retries, and HTTP/2 remain outside this API.
 Python documents the underlying [connection lifecycle](https://docs.python.org/3/library/http.client.html#http.client.HTTPConnection.getresponse)
 and [cookie policy](https://docs.python.org/3/library/http.cookiejar.html).
 
-**Recommendation:** keep ownership explicit. Any future streaming API must
-define when a body releases its connection before it can share this cache.
+**Recommendation:** keep ownership explicit. Streaming now shares this cache
+through a scoped, one-shot body. [Native async](async.md) must preserve those
+ownership rules before adding concurrency.
 
 [Back to design notes](README.md)

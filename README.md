@@ -29,8 +29,8 @@ Use **fetch.py** when the *dependency* is the problem:
   Understand the implementation as easily as the call site.
 - **Control** — teach HTTP, change behavior, and keep the pieces you need.
 
-The current scope is synchronous HTTP/1.1 with buffered responses, reusable
-sessions, and cookies. Async, streaming, and HTTP/2 remain outside this prototype.
+The current scope is synchronous HTTP/1.1 with buffered or streamed responses,
+reusable sessions, and cookies. Native async and HTTP/2 remain separate design work.
 
 ## Install
 
@@ -97,6 +97,38 @@ retries, including when a server has silently closed an idle connection.
 Module calls such as `fetch.get()` use a temporary session and keep no state
 between calls. See [Sessions](DOCS/sessions.md) for the full contract.
 
+## Streaming
+
+Read a download in bounded chunks:
+
+```python
+with fetch.stream("GET", "https://example.com/archive.tar", timeout=10) as r:
+    with open("archive.tar", "wb") as output:
+        for chunk in r.iter_bytes():
+            output.write(chunk)
+```
+
+`stream()` starts the request on entering `with`. Status and headers are available
+immediately; `iter_bytes(chunk_size=65536)` reads the body once, decoding gzip
+incrementally. Chunks may be smaller than the requested size.
+
+Use `s.stream(method, url, ...)` with a session to share its defaults and cookies.
+Fully consuming the body allows connection reuse. Leaving early closes the
+connection without draining the remaining body. Exit the stream context before
+making another request through that session.
+
+To deliberately buffer an unread stream, call `r.read()`; it returns the usual
+`Response`, with `.json()`, `.text`, and `.parse()`. A stream itself has no body
+properties that silently read the network.
+
+HTTP errors raise on context entry without downloading the error body. Their
+`.response` is a closed `StreamResponse` with status, headers, URL, and reason.
+Pass `check_status=False` to read an error body yourself. Buffered requests retain
+their complete error responses.
+
+See [Streaming](DOCS/streaming.md) for ownership and failure rules. Native async
+is [a separate design](DOCS/async.md); this release adds no async adapter.
+
 ## Response
 
 `Response` is fully buffered and owns no socket, so it needs no `close()`.
@@ -152,12 +184,13 @@ output handlers. See [Logging](DOCS/logging.md) for fields and configuration.
 
 | Type | When |
 | --- | --- |
-| `HTTPError` | 4xx/5xx when `check_status=True` (default); `.response` is set |
+| `HTTPError` | 4xx/5xx when `check_status=True`; `.response` matches buffered or streaming mode |
 | `Timeout` | socket operation exceeded `timeout` |
 | `RequestError` | connection / TLS / protocol failure |
 | `RedirectError` | too many redirects, bad Location, or HTTPS→HTTP |
 | `DecodeError` | body/gzip/text/JSON decode failure |
 | `ValueError` / `TypeError` | bad arguments (invalid URL, headers, timeout, …) |
+| `RuntimeError` | a closed session, a body already claimed/closed, or an overlapping session request |
 
 Invalid arguments fail fast. Network and HTTP failures use the hierarchy above.
 
@@ -173,7 +206,7 @@ Invalid arguments fail fast. Network and HTTP failures use the hierarchy above.
 - **Proxies / env:** off unless `trust_env=True`.
 - **Body:** `json=` and `data=` are mutually exclusive; `Content-Length` is
   calculated for you.
-- **No retries.** No streaming API yet.
+- **No retries.** Streaming is explicit; request bodies are still buffered.
 
 ## Request signature (abridged)
 
@@ -212,11 +245,12 @@ Implemented in the current prototype:
 - [x] Local HTTP tests, copied-file checks, and optional Pydantic integration
 - [x] Typed wheel built from the canonical source file
 - [x] Sessions with shared defaults, cookies, and direct connection reuse
+- [x] Explicit response streaming with bounded reads and incremental gzip decoding
 
 Next:
 
 - [ ] Decide public story for PyPI vs copy-in
-- [ ] Streaming / async — only with a coherent design, not a bolt-on
+- [ ] Native async — settle the engine and cancellation contract ([design](DOCS/async.md))
 
 ## Design notes
 
@@ -226,6 +260,8 @@ API ideas live in [`DOCS/`](DOCS/README.md) before they become features:
 - [Logging](DOCS/logging.md) — useful diagnostics through standard logging.
 - [Single file](DOCS/single-file.md) — the copy-in contract and its tradeoffs.
 - [Sessions](DOCS/sessions.md) — defaults, cookies, connection reuse, and cleanup.
+- [Streaming](DOCS/streaming.md) — one-shot bodies and explicit connection ownership.
+- [Async](DOCS/async.md) — a separate engine decision, using the same ownership rules.
 
 The notes distinguish current behavior from proposals and open questions.
 

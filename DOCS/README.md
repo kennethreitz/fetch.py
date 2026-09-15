@@ -16,6 +16,8 @@ unless a note explicitly identifies them as current behavior. The main
 | [Logging](logging.md) | How can callers see what happened without configuring another system? |
 | [Single file](single-file.md) | What does copying the library into a project promise? |
 | [Sessions](sessions.md) | Who owns shared defaults, cookies, and open connections? |
+| [Streaming](streaming.md) | When can a body release its connection? |
+| [Async](async.md) | How would native async share the same semantics? |
 
 ## Adding a topic
 

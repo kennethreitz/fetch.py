@@ -62,7 +62,7 @@ to avoid collisions with logging's reserved attributes.
 
 | Field | Meaning |
 | --- | --- |
-| `fetch_event` | `request.started`, `request.redirect`, `request.completed`, or `request.failed` |
+| `fetch_event` | `request.started`, `request.redirect`, `request.completed`, `request.closed`, or `request.failed` |
 | `fetch_method` | Method for the current hop; terminal records use the final attempted method |
 | `fetch_host` | Current destination hostname, without credentials, path, query, or fragment |
 | `fetch_status` | Status for this hop, or `None` if no response was received |
@@ -84,6 +84,12 @@ triggered the redirect. The next hop may use a different method or host.
 - A buffered response returned to the caller produces `request.completed`.
   This includes a 404 when `check_status=False`, or a redirect when following
   is disabled. Completion means the call returned a response.
+- A streaming request produces its terminal record on context exit:
+  `request.completed` after full consumption, `request.closed` after early
+  closure, or `request.failed` after a transport/body failure. A read failure
+  still produces `request.failed` if the application caught it inside the
+  context. An application exception is preserved; without a fetch failure,
+  the event describes whether the body was consumed or closed early.
 - An exception raised during the request produces `request.failed`, including
   HTTP status errors, transport failures, timeouts, invalid gzip, and refused
   or exhausted redirects. Keep the status when one was received.
@@ -94,6 +100,7 @@ triggered the redirect. The next hop may use a different method or host.
   [`time.perf_counter()`](https://docs.python.org/3.11/library/time.html#time.perf_counter).
   A request can take longer than `timeout`: the current timeout applies to
   individual socket operations, not the whole request.
+  For streams it also includes time the application spends inside the context.
 
 ## Keep the record small
 

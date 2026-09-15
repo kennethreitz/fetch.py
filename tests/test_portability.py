@@ -72,7 +72,11 @@ assert [r.fetch_event for r in records] == ["request.started", "request.complete
 assert all(r.name == sys.argv[1] for r in records)
 with fetch.Session(timeout=2) as session:
     assert session.get(sys.argv[2]).parse(json.loads) == {"portable": True}
+    with session.stream("GET", sys.argv[2]) as stream:
+        assert stream.read().json() == {"portable": True}
 assert session.closed
+with fetch.stream("GET", sys.argv[2], timeout=2) as stream:
+    assert json.loads(b"".join(stream.iter_bytes(3))) == {"portable": True}
 print(json.dumps({"status": response.status, "version": fetch.__version__}))
 """
                 env = {

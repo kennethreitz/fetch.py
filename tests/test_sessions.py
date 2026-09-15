@@ -322,6 +322,8 @@ class SessionTests(unittest.TestCase):
             with fetch.Session(context=trusted) as session:
                 first = session.get(url).json()["connection"]
                 self.assertEqual(session.get(url).json()["connection"], first)
+                with session.stream("GET", url) as stream:
+                    self.assertEqual(stream.read().json()["connection"], first)
                 self.assertEqual(server.accepted, 1)
             self.assertTrue(server.finished[first].wait(1))
 
