@@ -204,11 +204,12 @@ We work out APIs in [`DOCS/`](DOCS/README.md):
 
 ## Development
 
-Tests live in `tests/` and use local HTTP servers. Run the suite, including
-optional Pydantic integration, with:
+Tests live in `tests/` and use local HTTP servers. Install the locked development
+tools, then run the suite, including Pydantic integration:
 
 ```sh
-uv run --no-project --with pytest --with 'pydantic>=2,<3' python -m pytest
+uv sync --locked
+uv run --locked pytest
 ```
 
 The standard-library runner also works; Pydantic tests skip if it isn't installed:
@@ -217,16 +218,24 @@ The standard-library runner also works; Pydantic tests skip if it isn't installe
 python -m unittest discover -s tests -v
 ```
 
-Type checks and packaging:
+Lint, type checks, and packaging:
 
 ```sh
-uv run --no-project --with 'pydantic>=2,<3' --with mypy mypy fetch.py tests/check_types.py
-uv run --no-project --with 'pydantic>=2,<3' --with pyright pyright fetch.py tests/check_types.py
-uv build
+uv run --locked ruff check fetch.py setup.py tests
+uv run --locked ruff format --check fetch.py setup.py tests
+uv run --locked mypy fetch.py tests/check_types.py tests/check_installed_types.py
+uv run --locked pyright fetch.py tests/check_types.py tests/check_installed_types.py
+uv build --no-build-isolation
+uv run --locked python tests/check_distribution.py
 ```
 
 The wheel contains the exact source as `fetch/__init__.py`, plus `py.typed`.
 Editable installs use the original file. [The copy-in contract →](DOCS/single-file.md)
+
+[CI](.github/workflows/ci.yml) covers Python 3.11–3.14 on Linux, macOS, and Windows.
+It checks copied modules with site packages disabled, builds the wheel and sdist,
+and runs runtime and type checks against an isolated wheel installation. Keep
+only the current build in `dist/` when running the distribution check locally.
 
 ## License and credits
 

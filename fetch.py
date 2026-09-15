@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from email.message import Message
 from functools import partial
@@ -546,9 +546,10 @@ class Session:
                     self._stream_response = response
                 yield response
         except BaseException as exc:
-            if not isinstance(exc, HTTPError):
-                # Reading may have failed halfway through a response. Never
-                # return an uncertain connection to the cache or replay a call.
+            if self._stream_response is None and not isinstance(exc, HTTPError):
+                # Before delivery, a failure may leave an uncertain connection.
+                # Delivered streams close/discard their own body, so unrelated
+                # cached connections survive caller errors and early exits.
                 self._transport.close()
             raise
         finally:
@@ -712,6 +713,40 @@ def _network_error(exc: BaseException, url: str) -> RequestError:
     return RequestError(f"Request failed: {url}")
 
 
+def _open(
+    opener: urllib.request.OpenerDirector, request: urllib.request.Request, timeout: float
+) -> Any:
+    """Translate only failures from opening the connection, not caller code."""
+    try:
+        return opener.open(request, timeout=timeout)
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+        raise _network_error(exc, request.full_url) from exc
+
+
+@contextmanager
+def _response(
+    raw: Any, url: str, streaming: bool, discard: Callable[[Any], None]
+) -> Iterator[Response | StreamResponse]:
+    """Own a streamed body or buffer it before handing it to the caller."""
+    if streaming:
+        with closing(StreamResponse(raw, url, discard)) as response:
+            yield response
+        return
+
+    headers = Headers(raw.headers.raw_items())
+    try:
+        content = raw.read()
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+        raise _network_error(exc, url) from exc
+    # Empty bodies (including HEAD/204/304) need no gzip decoding.
+    if content and headers.get("content-encoding", "").lower().strip() == "gzip":
+        try:
+            content = gzip.decompress(content)
+        except (OSError, EOFError, zlib.error) as exc:
+            raise DecodeError("Response is not valid gzip") from exc
+    yield Response(int(raw.status), headers, content, url, raw.reason)
+
+
 @contextmanager
 def _request(
     opener: urllib.request.OpenerDirector,
@@ -809,85 +844,61 @@ def _request(
         )
 
     record("started")
-    response: Response | StreamResponse
-    delivered = False
-    live: StreamResponse | None = None
+    streamed: StreamResponse | None = None
+    error: BaseException | None = None
     try:
         for hop in range(max_redirects + 1):
             status = None
             req = urllib.request.Request(url, data=body, headers=outgoing, method=method)
-            try:
-                with opener.open(req, timeout=timeout) as raw:
-                    status, reason = int(raw.status), raw.reason
-                    response_headers = Headers(raw.headers.raw_items())
-                    live = StreamResponse(raw, url, discard) if streaming else None
-                    try:
-                        if live is not None:
-                            response = live
-                        else:
-                            content = raw.read()
-                            # Empty bodies need no gzip decoding.
-                            if (
-                                content
-                                and response_headers.get("content-encoding", "").lower().strip()
-                                == "gzip"
-                            ):
-                                try:
-                                    content = gzip.decompress(content)
-                                except (OSError, EOFError, zlib.error) as exc:
-                                    raise DecodeError("Response is not valid gzip") from exc
-                            response = Response(status, response_headers, content, url, reason)
-                        location = response.headers.get("location")
-                        if follow_redirects and status in _REDIRECTS and location:
-                            if hop == max_redirects:
-                                raise RedirectError(response)
-                            try:
-                                target = _url(urllib.parse.urljoin(url, location))
-                            except (ValueError, UnicodeError) as exc:
-                                raise RedirectError(response) from exc
-                            if url.startswith("https:") and target.startswith("http:"):
-                                raise RedirectError(response)
-                            record("redirect")
-                            if _origin(url) != _origin(target):
-                                for name in ("authorization", "cookie", "proxy-authorization"):
-                                    outgoing.pop(name, None)
-                            outgoing.pop("host", None)
-                            if (status in {301, 302} and method == "POST") or (
-                                status == 303 and method != "HEAD"
-                            ):
-                                method, body = "GET", None
-                                for name in list(outgoing):
-                                    if name.startswith("content-"):
-                                        del outgoing[name]
-                            url = target
-                            continue
-                        if check_status:
-                            response.raise_for_status()
-                        delivered = True
-                        yield response
-                        if live is not None and live._error is not None:
-                            record("failed", live._error)
-                        else:
-                            record(
-                                "closed" if live is not None and not live.consumed else "completed"
-                            )
-                        return
-                    finally:
-                        if live is not None:
-                            live.close()
-            except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
-                if delivered:
-                    # An application's exception inside its with block is not
-                    # a transport failure. Stream reads normalize their own.
-                    raise
-                raise _network_error(exc, url) from exc
+            with _open(opener, req, timeout) as raw:
+                # Keep the received status even if buffering the body fails.
+                status = int(raw.status)
+                with _response(raw, url, streaming, discard) as response:
+                    location = response.headers.get("location")
+                    if follow_redirects and status in _REDIRECTS and location:
+                        if hop == max_redirects:
+                            raise RedirectError(response)
+                        try:
+                            target = _url(urllib.parse.urljoin(url, location))
+                        except (ValueError, UnicodeError) as exc:
+                            raise RedirectError(response) from exc
+                        if url.startswith("https:") and target.startswith("http:"):
+                            raise RedirectError(response)
+                        record("redirect")
+                        if _origin(url) != _origin(target):
+                            for name in ("authorization", "cookie", "proxy-authorization"):
+                                outgoing.pop(name, None)
+                        outgoing.pop("host", None)
+                        if (status in {301, 302} and method == "POST") or (
+                            status == 303 and method != "HEAD"
+                        ):
+                            method, body = "GET", None
+                            for name in list(outgoing):
+                                if name.startswith("content-"):
+                                    del outgoing[name]
+                        url = target
+                        continue
+                    if check_status:
+                        response.raise_for_status()
+                    if isinstance(response, StreamResponse):
+                        streamed = response
+                    yield response
+                    return
         raise AssertionError("unreachable")
     except BaseException as exc:
-        if delivered and live is not None and live._error is None:
-            record("completed" if live.consumed else "closed")
-        else:
-            record("failed", exc)
+        error = exc
         raise
+    finally:
+        if streamed is not None:
+            # A caught body failure still counts. An application exception
+            # does not change whether the HTTP body completed or closed early.
+            error = streamed._error
+        event = (
+            "failed"
+            if error is not None
+            else ("closed" if streamed is not None and not streamed.consumed else "completed")
+        )
+        record(event, error)
 
 
 get = partial(request, "GET")

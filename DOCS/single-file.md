@@ -125,6 +125,13 @@ people who vendor it.
 The local suite includes [`tests/test_portability.py`](../tests/test_portability.py), which
 copies the file into temporary directories and launches Python with site
 packages disabled. Runtime checks cover both plain and qualified imports.
+The [CI workflow](../.github/workflows/ci.yml) covers Python 3.11–3.14 on Linux,
+macOS, and Windows, using the development tools pinned in `uv.lock`.
+[`tests/check_distribution.py`](../tests/check_distribution.py) verifies matching
+source bytes in the wheel and sdist, then tests an installed wheel in a clean
+environment without third-party runtime packages. It also runs mypy and Pyright
+against that installation, outside the checkout, to verify type discovery.
+
 The broader release checks are:
 
 - Copy only the file into a clean directory and make a request to a local server.

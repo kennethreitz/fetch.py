@@ -203,6 +203,30 @@ class StreamingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             stream.iter_bytes()
 
+    def test_application_error_preserves_other_cached_connections(self):
+        other = self.url.replace("127.0.0.1", "localhost")
+        with fetch.Session() as session:
+            first = session.get(other).json()["connection"]
+            with self.assertRaises(OSError), session.stream("GET", self.url + "/bytes"):
+                raise OSError("output file failed")
+            self.assertEqual(session.get(other).json()["connection"], first)
+
+    def test_logging_keeps_body_failure_when_caller_also_raises(self):
+        error = OSError("output cleanup failed")
+        with self.assertLogs("fetch", logging.DEBUG) as logs:
+            with (
+                self.assertRaises(OSError) as caught,
+                fetch.stream("GET", self.url + "/bad-gzip") as response,
+            ):
+                with self.assertRaises(fetch.DecodeError):
+                    response.read()
+                raise error
+        self.assertIs(caught.exception, error)
+        self.assertEqual(
+            [r.fetch_event for r in logs.records], ["request.started", "request.failed"]
+        )
+        self.assertEqual(logs.records[-1].fetch_error, "DecodeError")
+
     def test_body_can_only_be_claimed_once(self):
         with fetch.stream("GET", self.url + "/bytes") as response:
             chunks = response.iter_bytes(2)

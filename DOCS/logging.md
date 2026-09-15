@@ -90,6 +90,8 @@ triggered the redirect. The next hop may use a different method or host.
   still produces `request.failed` if the application caught it inside the
   context. An application exception is preserved; without a fetch failure,
   the event describes whether the body was consumed or closed early.
+  If both body reading and application cleanup fail, the record keeps the body
+  failure's type; the application's exception still propagates unchanged.
 - An exception raised during the request produces `request.failed`, including
   HTTP status errors, transport failures, timeouts, invalid gzip, and refused
   or exhausted redirects. Keep the status when one was received.

@@ -1,3 +1,4 @@
 include py.typed
+include uv.lock
 recursive-include tests *.py
 recursive-include DOCS *.md
