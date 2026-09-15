@@ -32,29 +32,47 @@ from __future__ import annotations
 import gzip
 import http.client
 import json as _json
+import logging
 import math
 import re
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from email.message import Message
 from functools import partial
-from typing import Any
+from typing import Any, TypeVar
 
 __version__ = "0.1.0"
 __all__ = [
-    "request", "get", "post", "put", "patch", "delete", "head", "options",
-    "Response", "Headers", "Error", "RequestError", "Timeout", "HTTPError",
-    "RedirectError", "DecodeError",
+    "DecodeError",
+    "Error",
+    "HTTPError",
+    "Headers",
+    "RedirectError",
+    "RequestError",
+    "Response",
+    "Timeout",
+    "delete",
+    "get",
+    "head",
+    "options",
+    "patch",
+    "post",
+    "put",
+    "request",
 ]
 
 _UNSET = object()
 _TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _REDIRECTS = {301, 302, 303, 307, 308}
+_T = TypeVar("_T")
+_log = logging.getLogger(__name__)
+_log.addHandler(logging.NullHandler())
 
 
 class Headers(Mapping[str, str]):
@@ -146,6 +164,14 @@ class Response:
         except (ValueError, UnicodeError) as exc:
             raise DecodeError("Response is not valid JSON") from exc
 
+    def parse(self, decoder: Callable[[bytes], _T]) -> _T:
+        """Call decoder once with the body, preserving its result and exceptions.
+
+        For example, response.parse(User.model_validate_json) with Pydantic.
+        This does not perform a request, check status, or cache the result.
+        """
+        return decoder(self.content)
+
     def raise_for_status(self) -> Response:
         if self.status >= 400:
             raise HTTPError(self)
@@ -171,6 +197,14 @@ def _url(value: str) -> str:
         raise ValueError("url must be an absolute http:// or https:// URL")
     if parts.username is not None or parts.password is not None:
         raise ValueError("Put credentials in headers, not in the URL")
+    # urllib unquotes the authority before connecting. Validate that same view
+    # so encoded controls and delimiters cannot bypass argument validation.
+    hostname = urllib.parse.unquote(parts.hostname, errors="strict")
+    if any(
+        char.isspace() or ord(char) < 32 or ord(char) == 127 or char in "\\/?#@[]"
+        for char in hostname
+    ) or hostname.count(":") != parts.hostname.count(":"):
+        raise ValueError("url hostname contains an invalid character")
     host = parts.hostname.encode("idna").decode("ascii")
     if ":" in host:
         host = f"[{host}]"
@@ -192,7 +226,9 @@ def _headers(values: Mapping[str, str] | None) -> dict[str, str]:
     for name, value in (values or {}).items():
         if not isinstance(name, str) or not _TOKEN.fullmatch(name):
             raise ValueError("Header names must be HTTP tokens")
-        if not isinstance(value, str) or any(ord(c) < 32 and c != "\t" or ord(c) == 127 for c in value):
+        if not isinstance(value, str) or any(
+            ord(c) < 32 and c != "\t" or ord(c) == 127 for c in value
+        ):
             raise ValueError("Header values must be strings without control characters")
         value.encode("latin-1")
         result[name.lower()] = value
@@ -233,7 +269,12 @@ def request(
     if not isinstance(method, str) or not _TOKEN.fullmatch(method):
         raise ValueError("method must be an HTTP token")
     method = method.upper()
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(timeout)
+        or timeout <= 0
+    ):
         raise ValueError("timeout must be a finite positive number of seconds")
     if isinstance(max_redirects, bool) or not isinstance(max_redirects, int) or max_redirects < 0:
         raise ValueError("max_redirects must be a nonnegative integer")
@@ -241,13 +282,17 @@ def request(
         raise ValueError("Use either json or data, not both")
     url = _url(url)
     if params is not None:
-        query = urllib.parse.urlencode(params if isinstance(params, Mapping) else list(params), doseq=True)
+        query = urllib.parse.urlencode(
+            params if isinstance(params, Mapping) else list(params), doseq=True
+        )
         if query:
             url += ("&" if urllib.parse.urlsplit(url).query else "?") + query
     outgoing = _headers(headers)
     body = None
     if json is not _UNSET:
-        body = _json.dumps(json, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        body = _json.dumps(json, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
         outgoing.setdefault("content-type", "application/json")
     elif isinstance(data, Mapping):
         body = urllib.parse.urlencode(data, doseq=True).encode("ascii")
@@ -266,48 +311,94 @@ def request(
         urllib.request.HTTPSHandler(context=context),
         _ReturnResponse(),
     )
-    for hop in range(max_redirects + 1):
-        req = urllib.request.Request(url, data=body, headers=outgoing, method=method)
-        try:
-            with opener.open(req, timeout=timeout) as raw:
-                response_headers = Headers(raw.headers.raw_items())
-                content = raw.read()
-                status, reason = raw.status, raw.reason
-        except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
-            cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
-            if isinstance(cause, TimeoutError):
-                raise Timeout(f"Request timed out: {url}") from exc
-            raise RequestError(f"Request failed: {url}") from exc
-        # HEAD/204/304 have no payload even if they describe compressed content.
-        if content and response_headers.get("content-encoding", "").lower().strip() == "gzip":
+    started = time.perf_counter()
+    status: int | None = None
+    hop = 0
+
+    def record(event: str, error: Exception | None = None) -> None:
+        if not _log.isEnabledFor(logging.DEBUG):
+            return
+        host = urllib.parse.urlsplit(url).hostname
+        elapsed = 0.0 if event == "started" else time.perf_counter() - started
+        # No URL, headers, bodies, or exception text enters a log record.
+        detail = event
+        if status is not None:
+            detail += f" -> {status}"
+        if error is not None:
+            detail += f" [{type(error).__name__}]"
+        if event != "started":
+            detail += f" ({elapsed:.3f}s)"
+        _log.debug(
+            "%s %s %s",
+            method,
+            host,
+            detail,
+            extra={
+                "fetch_event": f"request.{event}",
+                "fetch_method": method,
+                "fetch_host": host,
+                "fetch_status": status,
+                "fetch_elapsed": elapsed,
+                "fetch_timeout": timeout,
+                "fetch_redirects": hop,
+                "fetch_error": type(error).__name__ if error is not None else None,
+            },
+        )
+
+    record("started")
+    try:
+        for hop in range(max_redirects + 1):
+            status = None
+            req = urllib.request.Request(url, data=body, headers=outgoing, method=method)
             try:
-                content = gzip.decompress(content)
-            except (OSError, EOFError, zlib.error) as exc:
-                raise DecodeError("Response is not valid gzip") from exc
-        response = Response(status, response_headers, content, url, reason)
-        location = response.headers.get("location")
-        if follow_redirects and status in _REDIRECTS and location:
-            if hop == max_redirects:
-                raise RedirectError(response)
-            try:
-                target = _url(urllib.parse.urljoin(url, location))
-            except (ValueError, UnicodeError) as exc:
-                raise RedirectError(response) from exc
-            if url.startswith("https:") and target.startswith("http:"):
-                raise RedirectError(response)
-            if _origin(url) != _origin(target):
-                for name in ("authorization", "cookie", "proxy-authorization"):
-                    outgoing.pop(name, None)
-            outgoing.pop("host", None)
-            if (status in {301, 302} and method == "POST") or (status == 303 and method != "HEAD"):
-                method, body = "GET", None
-                for name in list(outgoing):
-                    if name.startswith("content-"):
-                        del outgoing[name]
-            url = target
-            continue
-        return response.raise_for_status() if check_status else response
-    raise AssertionError("unreachable")
+                with opener.open(req, timeout=timeout) as raw:
+                    status, reason = int(raw.status), raw.reason
+                    response_headers = Headers(raw.headers.raw_items())
+                    content = raw.read()
+            except (OSError, urllib.error.URLError, http.client.HTTPException) as exc:
+                cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+                if isinstance(cause, TimeoutError):
+                    raise Timeout(f"Request timed out: {url}") from exc
+                raise RequestError(f"Request failed: {url}") from exc
+            # HEAD/204/304 have no payload even if they describe compressed content.
+            if content and response_headers.get("content-encoding", "").lower().strip() == "gzip":
+                try:
+                    content = gzip.decompress(content)
+                except (OSError, EOFError, zlib.error) as exc:
+                    raise DecodeError("Response is not valid gzip") from exc
+            response = Response(status, response_headers, content, url, reason)
+            location = response.headers.get("location")
+            if follow_redirects and status in _REDIRECTS and location:
+                if hop == max_redirects:
+                    raise RedirectError(response)
+                try:
+                    target = _url(urllib.parse.urljoin(url, location))
+                except (ValueError, UnicodeError) as exc:
+                    raise RedirectError(response) from exc
+                if url.startswith("https:") and target.startswith("http:"):
+                    raise RedirectError(response)
+                record("redirect")
+                if _origin(url) != _origin(target):
+                    for name in ("authorization", "cookie", "proxy-authorization"):
+                        outgoing.pop(name, None)
+                outgoing.pop("host", None)
+                if (status in {301, 302} and method == "POST") or (
+                    status == 303 and method != "HEAD"
+                ):
+                    method, body = "GET", None
+                    for name in list(outgoing):
+                        if name.startswith("content-"):
+                            del outgoing[name]
+                url = target
+                continue
+            if check_status:
+                response.raise_for_status()
+            record("completed")
+            return response
+        raise AssertionError("unreachable")
+    except Exception as exc:
+        record("failed", exc)
+        raise
 
 
 get = partial(request, "GET")

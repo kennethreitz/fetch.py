@@ -83,9 +83,44 @@ Verbs: `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, plus
 | `content` | body `bytes`, after gzip decoding when declared |
 | `text` | decoded text (charset from Content-Type, else UTF-8) |
 | `json()` | parsed JSON |
+| `parse(decoder)` | call a bytes decoder; preserve its result type and exceptions |
 | `url` | final URL after redirects |
 | `ok` | `True` if 2xx |
 | `raise_for_status()` | raise `HTTPError` if status ≥ 400 |
+
+### Typed parsing
+
+Use a decoder your application already owns. With Pydantic v2 installed:
+
+```python
+from pydantic import BaseModel
+
+class User(BaseModel):
+    id: int
+    name: str
+
+user = fetch.get("https://api.example.com/users/42").parse(User.model_validate_json)
+```
+
+`user` is a `User`. `parse()` passes the body bytes to your decoder once and
+lets its exceptions propagate. Pydantic stays an application dependency; fetch
+never imports it. See [Pydantic](DOCS/pydantic.md) for arrays and outbound models.
+
+### Logging
+
+The client emits `DEBUG` records through standard-library logging:
+
+```python
+import logging
+
+logging.basicConfig(level=logging.DEBUG)  # application configuration
+fetch.get("https://example.com")
+```
+
+The logger is named `fetch`, or the qualified module name when vendored.
+Records include method, host, status, elapsed time, and redirect count. They
+omit headers, bodies, full URLs, and exception text. The client installs no
+output handlers. See [Logging](DOCS/logging.md) for fields and configuration.
 
 ## Errors
 
@@ -147,10 +182,12 @@ Implemented in the current prototype:
 - [x] Finite timeout + TLS verify
 - [x] Redirects with safe credential handling
 - [x] MIT license + `pyproject.toml`
+- [x] Generic typed parsing and structured debug logging
+- [x] Local HTTP tests, copied-file checks, and optional Pydantic integration
+- [x] Typed wheel built from the canonical source file
 
 Next:
 
-- [ ] Tests (200, JSON, HTTP error, timeout)
 - [ ] Decide public story for PyPI vs copy-in
 - [ ] Optional `Session` (connection reuse) — only if it stays small
 - [ ] Streaming / async — only with a coherent design, not a bolt-on
@@ -164,6 +201,35 @@ API ideas live in [`DOCS/`](DOCS/README.md) before they become features:
 - [Single file](DOCS/single-file.md) — the copy-in contract and its tradeoffs.
 
 The notes distinguish current behavior from proposals and open questions.
+
+## Development
+
+The test suite lives in `tests/` and uses local HTTP servers. Run it with pytest
+and Pydantic v2 in an isolated environment, using uv:
+
+```sh
+uv run --no-project --with pytest --with 'pydantic>=2,<3' python -m pytest
+```
+
+The standard-library runner also works. Pydantic tests skip when Pydantic v2
+is not installed:
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+`tests/check_types.py` contains static assertions for type checkers; pytest does
+not collect it. Run the type checks and build with:
+
+```sh
+uv run --no-project --with 'pydantic>=2,<3' --with mypy mypy tests/check_types.py
+uv run --no-project --with 'pydantic>=2,<3' --with pyright pyright tests/check_types.py
+uv build
+```
+
+The build installs the exact contents of `fetch.py` as `fetch/__init__.py`,
+with a `py.typed` marker for type checkers. Editable installs use the original
+source. The standalone file remains the only runtime implementation.
 
 ## License
 
