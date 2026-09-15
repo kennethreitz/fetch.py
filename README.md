@@ -1,9 +1,8 @@
 # fetch.py
 
-> HTTP you can keep in your pocket — one readable Python file, no dependencies.
+> Requests energy for when the dependency is the problem.
 
-How you'd build a tiny humane HTTP client today if vendoring was the goal,
-not a dependency tree.
+One readable Python file. No dependencies. HTTP you can keep in your pocket.
 
 ```python
 import fetch
@@ -16,16 +15,25 @@ verification are on. HTTP/1.1, synchronous, Python 3.11+.
 
 ## Why
 
-[Requests](https://requests.readthedocs.io/) taught a generation that HTTP
-could feel human. This is a spiritual cousin with a different spine:
+[Requests](https://requests.readthedocs.io/) still wins for most people — and it
+should. Huge ecosystem, everyone knows it, battle-tested.
 
-- **One file** — the implementation is a single module you can read and own.
-- **Zero dependencies** — stdlib only (`urllib`, `ssl`, `json`, …).
-- **Humane** — `get` / `post` / … and a small `Response`.
-- **Honest defaults** — finite timeout (30s), cert verification, HTTP 4xx/5xx
-  raise unless you opt out.
+Use **fetch.py** when the *dependency* is the problem:
+
+- **Vendoring** — one MIT file, no urllib3/certifi/charset stack. Scripts,
+  embedded tools, airgapped installs, “I refuse another dep.”
+- **Defaults with teeth** — finite timeout (30s) by default; 4xx/5xx raise
+  unless you opt out; no hang-forever culture.
+- **Readability as product** — audit the whole client in one sitting. Requests
+  is humane at the call site; this is humane in the implementation.
+- **Pedagogy / control** — teach HTTP, fork behavior, strip features without
+  fighting a cathedral.
+
+This is not a migration path off Requests for production apps that need
+sessions, connection pools, HTTP/2, or adapters. Requests and HTTPX own that.
 
 Not Requests 2. Not HTTPX with different branding. Not a framework.
+**Requests energy for when the dependency is the problem.**
 
 ## Install
 
