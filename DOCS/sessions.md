@@ -22,18 +22,21 @@ For a streamed response, use `with s.stream(method, url, ...) as r:` and consume
 
 ## Defaults and overrides
 
-The constructor accepts `headers`, `timeout=30.0`, `follow_redirects=True`,
-`max_redirects=10`, `check_status=True`, `trust_env=False`, `context=None`, and
-`max_connections=8`.
+The constructor accepts `headers`, `auth=None`, `timeout=30.0`,
+`follow_redirects=True`, `max_redirects=10`, `check_status=True`,
+`trust_env=False`, `context=None`, and `max_connections=8`.
 
 `request(method, url, ...)` and all seven verb helpers accept `params`, `headers`,
-`json`, `data`, `timeout`, `follow_redirects`, `max_redirects`, and `check_status`.
+`json`, `data`, `timeout`, `follow_redirects`, `max_redirects`, `check_status`,
+and `auth`.
+
 Per-request options override the session defaults. `None` for timeout or redirect
 and status options means inherit; it never disables the finite timeout.
 TLS context and proxy discovery are configured at construction.
 
-Headers are copied at construction and merged case-insensitively on every call.
-Per-request changes leave session defaults alone:
+Headers are copied at construction into a case-insensitive dictionary and merged
+on every call. Assigning `X-Token` replaces an existing `x-token`. Per-request
+changes leave session defaults alone:
 
 ```python
 with fetch.Session(headers={"Authorization": "Bearer ..."}) as s:
@@ -45,6 +48,12 @@ A `None` header removes a session header for that call. Built-in transport heade
 may still be supplied, and the cookie jar may still add applicable cookies.
 `s.headers` is a mutable dictionary. Set `s.timeout`, `s.follow_redirects`,
 `s.max_redirects`, or `s.check_status` to change future defaults.
+
+`auth=("username", "password")` adds `Authorization: Basic ...` when that header
+is not already set. Credentials are UTF-8. Per-request `auth` replaces the
+session pair for that call. An explicit `Authorization` header wins, and
+`headers={"Authorization": None}` sends the call with no credentials. A
+cross-origin redirect drops the header and does not put `auth` back.
 
 Session headers apply to every URL explicitly requested through that session.
 Use separate sessions for services with different credentials. Redirects strip

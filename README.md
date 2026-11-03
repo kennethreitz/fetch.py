@@ -53,11 +53,19 @@ print(r.json())
 ```
 
 Use `params=` for query parameters, `json=` for JSON, and `data=` for bytes,
-text, or a mapping of form fields. Add headers with `headers={"Accept": "application/json"}`.
+text, or a mapping of form fields. `None` parameter and form values are left
+out. Add headers with `headers={"Accept": "application/json"}`.
+
+```python
+fetch.get("https://api.example.com/me", auth=("user", "password"))
+```
+
+`auth` sends Basic credentials, encoded as UTF-8. An `Authorization` header
+passed in the same call wins.
 
 All seven verbs are available: `get`, `post`, `put`, `patch`, `delete`, `head`,
 and `options`. For other methods, use `request(method, url, ...)`.
-URLs must be absolute HTTP or HTTPS URLs; put credentials in headers.
+URLs must be absolute HTTP or HTTPS URLs. Put credentials in `auth` or headers, not in the URL.
 
 ### Read the response
 
@@ -69,9 +77,12 @@ needs no `close()`.
 | `status`, `reason` | Status code and reason phrase |
 | `url` | Final URL after redirects |
 | `headers` | Case-insensitive mapping; `get_all()` preserves repeated fields |
-| `content` | Body bytes, with gzip decoded when declared |
-| `text` | Text using the declared charset, or UTF-8 |
-| `json()` | Parsed JSON |
+| `content` | Body bytes, with gzip or x-gzip decoded when that is the only coding |
+| `text` | Text using the declared charset, a BOM when the charset is absent, or UTF-8 |
+| `encoding` | Charset declared by Content-Type, or `None` |
+| `json()` | Parsed JSON, including UTF-8, UTF-16, UTF-32, and a byte-order mark |
+| `elapsed` | Seconds from the start of the call until the body was buffered |
+| `history` | Earlier redirect responses, oldest first |
 | `parse(decoder)` | Pass body bytes to a decoder and preserve its return type |
 | `ok` | `True` for 2xx |
 | `raise_for_status()` | Raise `HTTPError` for status ≥ 400 |
@@ -87,9 +98,11 @@ with fetch.Session(headers={"User-Agent": "my-app/1.0"}, timeout=5) as s:
 ```
 
 Sessions have the same verbs as the module. Per-request options override session
-defaults; headers merge case-insensitively. A header value of `None` removes a
-session header for that call. Cookies live in `s.cookies`, a standard-library
-`CookieJar`.
+defaults; headers merge case-insensitively. `s.headers` is a dictionary whose
+keys are matched without regard to case. A header value of `None` removes a
+session header for that call. `auth=("user", "password")` on the session or on
+one call sends Basic credentials; `headers={"Authorization": None}` omits them
+for that call. Cookies live in `s.cookies`, a standard-library `CookieJar`.
 
 Use `with`, or call `s.close()`. Each session is for sequential use and caches
 up to eight direct HTTP/HTTPS connections (`max_connections=8`). Proxy
@@ -121,6 +134,7 @@ Exit the stream context before making another request through that session.
 | Default | Behavior |
 | --- | --- |
 | `timeout=30.0` | Finite, positive seconds per socket operation; not a total deadline |
+| Default headers | `User-Agent: fetch.py/<version>`, `Accept: */*`, and `Accept-Encoding: gzip`, unless overridden |
 | Verified TLS | Pass `context=` for a custom `ssl.SSLContext` |
 | `check_status=True` | HTTP 4xx/5xx raise `HTTPError` |
 | `follow_redirects=True` | Follow up to `max_redirects=10`; refuse HTTPS → HTTP |
@@ -129,8 +143,11 @@ Exit the stream context before making another request through that session.
 | No retries | Failed requests are never automatically replayed |
 
 Redirects strip explicit credentials on an origin change. POST on 301/302 and
-non-HEAD on 303 become GET. `json=` and `data=` are mutually exclusive;
-fetch calculates `Content-Length` for you.
+non-HEAD on 303 become GET. Surrounding whitespace on a `Location` value is
+not part of the next URL. `json=` and `data=` are mutually exclusive;
+fetch calculates `Content-Length` for you. `data` accepts `bytes`, `bytearray`,
+and `memoryview`. URLs may use Unicode or characters that are already
+percent-encoded.
 
 ## Errors
 

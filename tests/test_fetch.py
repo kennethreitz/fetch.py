@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import http.client
+import inspect
 import json
 import logging
+import socket
 import ssl
 import threading
 import time
@@ -55,6 +58,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parts.path == "/gzip":
             content = gzip.compress(b'{"greeting":"hello"}')
             headers.append(("Content-Encoding", "gzip"))
+        elif parts.path == "/x-gzip":
+            content = gzip.compress(b'{"greeting":"hello"}')
+            headers.append(("Content-Encoding", "X-Gzip"))
         elif parts.path == "/bad-gzip":
             content = b"this is not gzip"
             headers.append(("Content-Encoding", "gzip"))
@@ -239,6 +245,7 @@ class FetchTests(unittest.TestCase):
 
     def test_gzip_charset_and_empty_responses(self):
         self.assertEqual(fetch.get(self.base + "/gzip").json(), {"greeting": "hello"})
+        self.assertEqual(fetch.get(self.base + "/x-gzip").json(), {"greeting": "hello"})
         self.assertEqual(fetch.get(self.base + "/latin1").text, "caf\u00e9")
         response = fetch.get(self.base + "/status/204")
         self.assertEqual(response.content, b"")
@@ -507,12 +514,169 @@ class FetchTests(unittest.TestCase):
             (("GET", self.base), {"headers": {"X-Test": "\r\ninjected"}}),
             (("GET", self.base), {"headers": {"Content-Length": "99"}}),
             (("GET", self.base), {"headers": {"Transfer-Encoding": "chunked"}}),
+            (("GET", self.base), {"headers": {"X-Test": "caf\u20ac"}}),
+            (("GET", self.base), {"auth": "user:pass"}),
+            (("GET", self.base), {"auth": ("only",)}),
+            (("GET", self.base), {"auth": ("bad\nuser", "secret")}),
+            (("POST", self.base), {"json": "\ud800"}),
+            (("GET", self.base), {"params": "q=1"}),
         ]
         for args, kwargs in cases:
             with self.subTest(args=args, kwargs=kwargs), capture_logs() as records:
                 with self.assertRaises((ValueError, TypeError)):
                     fetch.request(*args, **kwargs)
                 self.assertEqual(records, [])
+
+    def test_verbs_share_the_request_signature(self):
+        expected = list(inspect.signature(fetch.request).parameters)[1:]
+        for name in ("get", "post", "put", "patch", "delete", "head", "options"):
+            verb = getattr(fetch, name)
+            self.assertEqual(list(inspect.signature(verb).parameters), expected)
+            self.assertIn("request()", verb.__doc__)
+        self.assertIn("auth", inspect.signature(fetch.Session.request).parameters)
+        self.assertIn("auth", inspect.signature(fetch.stream).parameters)
+
+    def test_default_headers_and_bytes_like_bodies(self):
+        headers = fetch.get(self.base).json()["headers"]
+        self.assertEqual(headers["accept"], "*/*")
+        self.assertEqual(headers["accept-encoding"], "gzip")
+        self.assertTrue(headers["user-agent"].startswith("fetch.py/"))
+        custom = fetch.get(self.base, headers={"Accept": "application/json"}).json()["headers"]
+        self.assertEqual(custom["accept"], "application/json")
+        for value in (bytearray(b"binary"), memoryview(b"binary")):
+            with self.subTest(value=type(value).__name__):
+                data = fetch.post(self.base, data=value).json()
+                self.assertEqual(data["body"], "binary")
+                self.assertEqual(data["headers"]["content-type"], "application/octet-stream")
+
+    def test_none_query_and_form_values_are_omitted(self):
+        response = fetch.get(
+            self.base, params={"q": None, "keep": "yes", "tag": ["a", None], "n": 0, "flag": False}
+        )
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(response.json()["path"]).query)
+        self.assertEqual(query, {"keep": ["yes"], "tag": ["a"], "n": ["0"], "flag": ["False"]})
+        body = fetch.post(self.base, data={"q": None, "keep": "yes", "tag": ["a", None]}).json()
+        self.assertEqual(urllib.parse.parse_qs(body["body"]), {"keep": ["yes"], "tag": ["a"]})
+
+    def test_preserved_percent_encoding(self):
+        path = fetch.get(self.base + "/caf%C3%A9?q=a+b&x=1%20").json()["path"]
+        split = urllib.parse.urlsplit(path)
+        self.assertEqual(split.path, "/caf%C3%A9")
+        self.assertIn("q=a+b", split.query)
+        self.assertIn("x=1%20", split.query)
+
+    def test_basic_auth_header_and_logging(self):
+        secret = "auth-secret-value"
+        token = base64.b64encode(f"caf\u00e9:{secret}".encode()).decode()
+        with capture_logs() as records:
+            headers = fetch.get(self.base, auth=("caf\u00e9", secret)).json()["headers"]
+        self.assertEqual(headers["authorization"], f"Basic {token}")
+        overridden = fetch.get(
+            self.base, auth=("caf\u00e9", secret), headers={"Authorization": "Bearer token"}
+        ).json()["headers"]
+        self.assertEqual(overridden["authorization"], "Bearer token")
+        for record in records:
+            self.assertNotIn(secret, record.getMessage() + repr(vars(record)))
+
+    def test_redirect_history_elapsed_and_trimmed_location(self):
+        response = fetch.get(self.redirect(302, "/echo "))
+        self.assertEqual(response.url, self.base + "/echo")
+        self.assertEqual(response.json()["path"], "/echo")
+        self.assertEqual(len(response.history), 1)
+        hop = response.history[0]
+        self.assertEqual(hop.status, 302)
+        self.assertEqual(hop.content, b"redirect")
+        self.assertEqual(hop.history, ())
+        self.assertGreater(response.elapsed, 0)
+        self.assertGreaterEqual(response.elapsed, hop.elapsed)
+        chained = fetch.get(self.redirect(302, self.redirect(301)))
+        self.assertEqual([item.status for item in chained.history], [302, 301])
+        self.assertEqual(chained.json()["path"], "/echo")
+        blank = fetch.get(self.redirect(302, "   "))
+        self.assertEqual(blank.status, 302)
+        self.assertEqual(blank.history, ())
+        with self.assertRaises(fetch.HTTPError) as caught:
+            fetch.get(self.redirect(302, "/status/404"))
+        self.assertEqual(caught.exception.response.status, 404)
+        self.assertEqual(caught.exception.response.history[0].status, 302)
+        self.assertEqual(caught.exception.response.history[0].content, b"redirect")
+
+    def test_text_encoding_bom_and_declared_charset(self):
+        utf8 = fetch.Response(
+            200,
+            fetch.Headers([("Content-Type", 'text/plain; charset="UTF-8"')]),
+            "caf\u00e9".encode("utf-8-sig"),
+            self.base,
+        )
+        self.assertEqual(utf8.encoding, "utf-8")
+        self.assertEqual(utf8.text, "caf\u00e9")
+        declared = fetch.Response(
+            200,
+            fetch.Headers([("Content-Type", "text/plain; charset=iso-8859-1")]),
+            b"\xef\xbb\xbf" + "\u00e9".encode("latin-1"),
+            self.base,
+        )
+        self.assertEqual(declared.encoding, "iso-8859-1")
+        self.assertEqual(declared.text, "\u00ef\u00bb\u00bf\u00e9")
+        sniffed = fetch.Response(200, fetch.Headers(), "caf\u00e9".encode("utf-16"), self.base)
+        self.assertIsNone(sniffed.encoding)
+        self.assertEqual(sniffed.text, "caf\u00e9")
+        utf32 = fetch.Response(200, fetch.Headers(), "caf\u00e9".encode("utf-32"), self.base)
+        self.assertEqual(utf32.text, "caf\u00e9")
+        for body in ('{"a": 1}'.encode("utf-16"), b'\xef\xbb\xbf{"a": 1}'):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    fetch.Response(200, fetch.Headers(), body, self.base).json(), {"a": 1}
+                )
+
+    def test_unicode_host_and_https_to_https_redirect(self):
+        def respond(request, timeout):
+            raw = MagicMock()
+            raw.__enter__.return_value = raw
+            raw.headers = Message()
+            raw.info.return_value = raw.headers
+            raw.status, raw.reason = 200, "OK"
+            raw.length = 0
+            raw.read1.return_value = b""
+            if request.full_url.startswith("https://first.example"):
+                raw.status, raw.reason = 302, "Found"
+                raw.headers["Location"] = "https://second.example/done"
+            return raw
+
+        opener = MagicMock()
+        opener.open.side_effect = respond
+        with patch("fetch.urllib.request.build_opener", return_value=opener):
+            response = fetch.get("https://first.example/start")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.url, "https://second.example/done")
+            self.assertEqual([item.status for item in response.history], [302])
+            fetch.get("http://caf\u00e9.example/path")
+        requested = [call.args[0].full_url for call in opener.open.call_args_list]
+        self.assertEqual(opener.open.call_count, 3)
+        self.assertIn("https://second.example/done", requested)
+        self.assertTrue(any(url.startswith("http://xn--caf-dma.example/") for url in requested))
+
+    def test_ipv6_loopback_url(self):
+        class V6Server(ThreadingHTTPServer):
+            address_family = socket.AF_INET6
+
+        try:
+            server = V6Server(("::1", 0), Handler)
+        except OSError:
+            self.skipTest("IPv6 loopback is unavailable")
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        # Cleanups run last-added first. Shut the server down before joining it.
+        self.addCleanup(thread.join)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        url = f"http://[::1]:{server.server_port}/ipv6"
+        response = fetch.get(url, timeout=2)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.json()["path"], "/ipv6")
+        self.assertTrue(response.url.startswith("http://[::1]:"))
 
 
 if __name__ == "__main__":

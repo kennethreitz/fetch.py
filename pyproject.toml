@@ -18,6 +18,11 @@ classifiers = [
     "Topic :: Internet :: WWW/HTTP",
 ]
 
+[project.urls]
+Homepage = "https://github.com/kennethreitz/fetch.py"
+Repository = "https://github.com/kennethreitz/fetch.py"
+Documentation = "https://github.com/kennethreitz/fetch.py/blob/main/README.md"
+
 [tool.setuptools]
 py-modules = ["fetch"]
 
@@ -27,6 +32,13 @@ version = {attr = "fetch.__version__"}
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+
+[tool.pyright]
+pythonVersion = "3.11"
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]

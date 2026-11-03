@@ -145,7 +145,17 @@ class SessionTests(unittest.TestCase):
             self.assertEqual(headers["x-shared"], "default")
             self.assertEqual(headers["authorization"], "token")
             session.headers["X-Shared"] = "updated"
+            self.assertIsInstance(session.headers, dict)
+            self.assertEqual(session.headers["x-SHARED"], "updated")
+            self.assertEqual(list(session.headers).count("x-shared"), 1)
+            copied = session.headers.copy()
+            copied["X-Shared"] = "copied"
+            self.assertEqual(session.headers["x-shared"], "updated")
             self.assertEqual(session.get(self.url).json()["headers"]["x-shared"], "updated")
+            del session.headers["X-Shared"]
+            gone = session.get(self.url).json()["headers"]
+            self.assertNotIn("x-shared", gone)
+            self.assertEqual(gone["authorization"], "token")
 
     def test_request_options_override_session_defaults(self):
         with fetch.Session(check_status=False, follow_redirects=False, max_redirects=0) as session:
@@ -373,6 +383,32 @@ class SessionTests(unittest.TestCase):
             fetch.Session(timeout=0)
         with self.assertRaises(ValueError):
             fetch.Session(max_redirects=-1)
+        for value in (("only",), "user:pass", ("bad\n", "x"), (1, "pw")):
+            with self.subTest(value=value), self.assertRaises((TypeError, ValueError)):
+                fetch.Session(auth=value)
+
+    def test_session_auth_stays_on_origin_until_removed(self):
+        with fetch.Session(auth=("user", "secret")) as session:
+            sent = session.get(self.url).json()["headers"]["authorization"]
+            self.assertTrue(sent.startswith("Basic "))
+            target = self.servers[1].url
+            changed = session.get(
+                self.url + "/redirect?" + urllib.parse.urlencode({"to": target})
+            ).json()["headers"]
+            self.assertNotIn("authorization", changed)
+            self.assertEqual(session.get(self.url).json()["headers"]["authorization"], sent)
+            removed = session.get(self.url, headers={"Authorization": None}).json()["headers"]
+            self.assertNotIn("authorization", removed)
+            replaced = session.get(self.url, headers={"Authorization": "Bearer t"}).json()[
+                "headers"
+            ]
+            self.assertEqual(replaced["authorization"], "Bearer t")
+            other = session.get(self.url, auth=("other", "secret")).json()["headers"][
+                "authorization"
+            ]
+            self.assertNotEqual(other, sent)
+            self.assertTrue(other.startswith("Basic "))
+            self.assertEqual(session.get(self.url).json()["headers"]["authorization"], sent)
 
 
 if __name__ == "__main__":

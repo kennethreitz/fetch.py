@@ -314,6 +314,10 @@ class StreamingTests(unittest.TestCase):
             self.assertEqual(data["headers"]["x-shared"], "yes")
             self.assertEqual(data["connection"], 2)
             self.assertFalse(self.server.release.is_set())
+            self.assertEqual([item.status for item in response.history], [302])
+            self.assertEqual(response.history[0].content, b"")
+            self.assertGreater(response.elapsed, 0)
+            self.assertIsNone(response.encoding)
 
     def test_streaming_redirect_errors_release_socket(self):
         with (

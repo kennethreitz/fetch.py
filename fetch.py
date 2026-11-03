@@ -29,6 +29,7 @@ THE SOFTWARE.
 
 from __future__ import annotations
 
+import base64
 import gzip
 import http.client
 import http.cookiejar
@@ -43,14 +44,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zlib
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from email.message import Message
-from functools import partial
-from typing import Any, Self, TypedDict, TypeVar, Unpack, cast
+from typing import Any, Self, TypedDict, TypeVar, Unpack
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "DecodeError",
     "Error",
@@ -73,8 +73,21 @@ __all__ = [
     "stream",
 ]
 
-_UNSET = object()
+
+class _Unset:
+    """Marks an omitted json= argument, so None can still send a JSON null."""
+
+    def __repr__(self) -> str:
+        return "omitted"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+_UNSET = _Unset()
 _TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
+_GZIP = {"gzip", "x-gzip"}
+_UTF8 = {"utf-8", "utf8", "utf-8-sig"}
 _REDIRECTS = {301, 302, 303, 307, 308}
 _T = TypeVar("_T")
 _log = logging.getLogger(__name__)
@@ -86,6 +99,9 @@ class Headers(Mapping[str, str]):
 
     def __init__(self, items: Iterable[tuple[str, str]] = ()) -> None:
         self._items = tuple(items)
+
+    def __repr__(self) -> str:
+        return f"Headers({list(self._items)!r})"
 
     def __getitem__(self, name: str) -> str:
         values = self.get_all(name)
@@ -104,6 +120,7 @@ class Headers(Mapping[str, str]):
         return sum(1 for _ in self)
 
     def get_all(self, name: str) -> list[str]:
+        """Return every value for this field, in the order they arrived."""
         return [value for key, value in self._items if key.lower() == name.lower()]
 
 
@@ -137,34 +154,49 @@ class RedirectError(HTTPError):
 
 @dataclass(frozen=True)
 class Response:
-    """A fully read response; it owns no open socket and needs no close()."""
+    """A fully read response; it owns no open socket and needs no close().
+
+    elapsed is seconds from the start of the call until this body was buffered.
+    history contains earlier redirect responses, oldest first, not this one.
+    """
 
     status: int
     headers: Headers
     content: bytes
     url: str
     reason: str = ""
+    elapsed: float = 0.0
+    history: tuple[Response, ...] = ()
 
     def __repr__(self) -> str:
         return f"<Response [{self.status}]>"
 
     @property
     def ok(self) -> bool:
+        """True when the status code is in the 2xx range."""
         return 200 <= self.status < 300
 
     @property
+    def encoding(self) -> str | None:
+        """Charset declared by Content-Type, or None when the response does not say."""
+        return _declared_charset(self.headers)
+
+    @property
     def text(self) -> str:
-        """Decode the declared charset, or UTF-8. Invalid input raises."""
-        message = Message()
-        message["content-type"] = self.headers.get("content-type", "")
-        encoding = message.get_content_charset() or "utf-8"
+        """Decode the body with the declared charset, or UTF-8.
+
+        A byte-order mark selects UTF-8, UTF-16, or UTF-32 when no charset is
+        declared. A UTF-8 BOM is not left in the text. Invalid input raises
+        DecodeError.
+        """
+        encoding = _text_encoding(self.headers, self.content)
         try:
             return self.content.decode(encoding)
         except (LookupError, UnicodeError) as exc:
             raise DecodeError(f"Cannot decode response as {encoding}") from exc
 
     def json(self) -> Any:
-        """Parse JSON, including UTF-8/16/32 and byte-order marks."""
+        """Parse JSON, including UTF-8, UTF-16, UTF-32, and byte-order marks."""
         try:
             return _json.loads(self.content)
         except (ValueError, UnicodeError) as exc:
@@ -179,6 +211,7 @@ class Response:
         return decoder(self.content)
 
     def raise_for_status(self) -> Response:
+        """Raise HTTPError when status is 400 or above, and return this response."""
         if self.status >= 400:
             raise HTTPError(self)
         return self
@@ -221,12 +254,24 @@ class StreamResponse:
 
     iter_bytes() yields decoded bytes; read() explicitly buffers a Response.
     Closing before successful exhaustion discards the underlying connection.
+    elapsed is seconds until the response headers arrived. history contains
+    earlier redirects; their bodies are empty because streamed redirects are
+    not downloaded.
     """
 
-    def __init__(self, raw: Any, url: str, discard: Callable[[Any], None]) -> None:
+    def __init__(
+        self,
+        raw: Any,
+        url: str,
+        discard: Callable[[Any], None],
+        started: float | None = None,
+    ) -> None:
         self.status, self.reason, self.url = int(raw.status), raw.reason, url
         self.headers = Headers(raw.headers.raw_items())
+        self.elapsed = 0.0
+        self.history: tuple[Response, ...] = ()
         self._raw, self._discard = raw, discard
+        self._clock = time.perf_counter() if started is None else started
         self._closed = self._started = self._consumed = False
         self._buffered: Response | None = None
         self._error: BaseException | None = None
@@ -236,22 +281,32 @@ class StreamResponse:
 
     @property
     def ok(self) -> bool:
+        """True when the status code is in the 2xx range."""
         return 200 <= self.status < 300
 
     @property
+    def encoding(self) -> str | None:
+        """Charset declared by Content-Type, or None when the response does not say."""
+        return _declared_charset(self.headers)
+
+    @property
     def closed(self) -> bool:
+        """Whether body access has ended."""
         return self._closed
 
     @property
     def consumed(self) -> bool:
+        """Whether iteration reached and validated the end of the body."""
         return self._consumed
 
     def raise_for_status(self) -> Self:
+        """Raise HTTPError when status is 400 or above, without reading the body."""
         if self.status >= 400:
             raise HTTPError(self)
         return self
 
     def close(self) -> None:
+        """Close the body. An unfinished body discards its connection."""
         if not self.closed:
             self._closed = True
             try:
@@ -277,7 +332,7 @@ class StreamResponse:
         reader = _BodyReader(self._raw, chunk_size)
         decoder: gzip.GzipFile | None = None
         try:
-            reader.gzip = self.headers.get("content-encoding", "").lower().strip() == "gzip"
+            reader.gzip = _gzip_encoded(self.headers)
             if reader.gzip:
                 decoder = gzip.GzipFile(fileobj=reader, mode="rb")
             while True:
@@ -308,10 +363,19 @@ class StreamResponse:
         """Buffer an unread body; repeated calls return the same Response.
 
         After starting iter_bytes(), read() cannot recover already yielded bytes.
+        The returned elapsed time includes reading and decoding this body.
         """
         if self._buffered is None:
             content = b"".join(self.iter_bytes())
-            self._buffered = Response(self.status, self.headers, content, self.url, self.reason)
+            self._buffered = Response(
+                self.status,
+                self.headers,
+                content,
+                self.url,
+                self.reason,
+                time.perf_counter() - self._clock,
+                self.history,
+            )
         return self._buffered
 
 
@@ -383,15 +447,58 @@ class _SessionTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
         return response
 
 
+class _HeaderDict(dict[str, str]):
+    """Mutable headers stored and looked up by lowercase name."""
+
+    def __init__(self, values: Mapping[str, str] | None = None) -> None:
+        super().__init__()
+        if values:
+            for key, value in values.items():
+                self[key] = value
+
+    def __getitem__(self, key: str) -> str:
+        return super().__getitem__(key.lower())
+
+    def __setitem__(self, key: str, value: str) -> None:
+        super().__setitem__(key.lower(), value)
+
+    def __delitem__(self, key: str) -> None:
+        super().__delitem__(key.lower())
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and super().__contains__(key.lower())
+
+    def get(self, key: str, default: str | None = None) -> str | None:  # type: ignore[override]
+        if not isinstance(key, str):
+            return default
+        return super().get(key.lower(), default)
+
+    def pop(self, key: str, *args: Any) -> Any:
+        return super().pop(key.lower(), *args)
+
+    def update(  # type: ignore[override]
+        self, values: Mapping[str, str] | None = None, **kwargs: str
+    ) -> None:
+        if values is not None:
+            for key, value in values.items():
+                self[key] = value
+        for key, value in kwargs.items():
+            self[key] = value
+
+    def copy(self) -> _HeaderDict:
+        return _HeaderDict(self)
+
+
 class _SessionOptions(TypedDict, total=False):
     params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None
     headers: Mapping[str, str | None] | None
     json: Any
-    data: bytes | str | Mapping[str, Any] | None
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None
     timeout: float | None
     follow_redirects: bool | None
     max_redirects: int | None
     check_status: bool | None
+    auth: tuple[str, str] | None
 
 
 class Session:
@@ -413,7 +520,15 @@ class Session:
         trust_env: bool = False,
         context: ssl.SSLContext | None = None,
         max_connections: int = 8,
+        auth: tuple[str, str] | None = None,
     ) -> None:
+        """Create a session.
+
+        headers, timeout, redirects, check_status, and auth are defaults for
+        later calls. auth is a Basic (username, password) pair. trust_env and
+        context are fixed for the life of the session. Keys in headers are
+        matched without regard to case.
+        """
         _validate_limits(timeout, max_redirects)
         if (
             isinstance(max_connections, bool)
@@ -421,11 +536,12 @@ class Session:
             or max_connections < 1
         ):
             raise ValueError("max_connections must be a positive integer")
-        self.headers = _headers(headers)
+        self.headers = _HeaderDict(_headers(headers))
         self.timeout = timeout
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
         self.check_status = check_status
+        self.auth = None if auth is None else _auth_pair(auth)
         self.cookies = http.cookiejar.CookieJar(
             http.cookiejar.DefaultCookiePolicy(
                 strict_ns_domain=http.cookiejar.DefaultCookiePolicy.DomainStrictNonDomain
@@ -459,23 +575,80 @@ class Session:
     def __exit__(self, *exc: object) -> None:
         self.close()
 
-    def request(self, method: str, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
-        """Send a buffered request, overriding session defaults for this call."""
-        with self._send(method, url, streaming=False, **kwargs) as response:
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+        headers: Mapping[str, str | None] | None = None,
+        json: Any = _UNSET,
+        data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        follow_redirects: bool | None = None,
+        max_redirects: int | None = None,
+        check_status: bool | None = None,
+        auth: tuple[str, str] | None = None,
+    ) -> Response:
+        """Send a buffered request, overriding session defaults for this call.
+
+        None for timeout, follow_redirects, max_redirects, and check_status
+        keeps the session value. auth replaces session credentials for this
+        call. See fetch.request() for bodies, redirects, and errors.
+        """
+        with self._send(
+            method,
+            url,
+            streaming=False,
+            params=params,
+            headers=headers,
+            json=json,
+            data=data,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            max_redirects=max_redirects,
+            check_status=check_status,
+            auth=auth,
+        ) as response:
             assert isinstance(response, Response)
             return response
 
     @contextmanager
     def stream(
-        self, method: str, url: str, **kwargs: Unpack[_SessionOptions]
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+        headers: Mapping[str, str | None] | None = None,
+        json: Any = _UNSET,
+        data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+        timeout: float | None = None,
+        follow_redirects: bool | None = None,
+        max_redirects: int | None = None,
+        check_status: bool | None = None,
+        auth: tuple[str, str] | None = None,
     ) -> Iterator[StreamResponse]:
         """Open a body inside a with block; exit closes any unread remainder.
 
-        HTTP errors raise on entry, with a closed StreamResponse as .response.
-        Set check_status=False to inspect or read an error body yourself.
-        Exit this context before making another request through the session.
+        Arguments match request(). HTTP errors raise on entry, with a closed
+        StreamResponse as .response. Set check_status=False to read an error
+        body yourself. Exit this context before another request on the session.
         """
-        with self._send(method, url, streaming=True, **kwargs) as response:
+        with self._send(
+            method,
+            url,
+            streaming=True,
+            params=params,
+            headers=headers,
+            json=json,
+            data=data,
+            timeout=timeout,
+            follow_redirects=follow_redirects,
+            max_redirects=max_redirects,
+            check_status=check_status,
+            auth=auth,
+        ) as response:
             assert isinstance(response, StreamResponse)
             yield response
 
@@ -489,29 +662,37 @@ class Session:
         params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
         headers: Mapping[str, str | None] | None = None,
         json: Any = _UNSET,
-        data: bytes | str | Mapping[str, Any] | None = None,
+        data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
         timeout: float | None = None,
         follow_redirects: bool | None = None,
         max_redirects: int | None = None,
         check_status: bool | None = None,
+        auth: tuple[str, str] | None = None,
     ) -> Iterator[Response | StreamResponse]:
         """Send using session defaults; None options inherit those defaults.
 
         Headers merge case-insensitively. A None header removes a session
         header for this call; built-in transport defaults may still apply.
-        TLS context and proxy discovery are fixed when the session is created.
+        An explicit Authorization header wins over auth. Passing Authorization
+        as None removes session credentials for this call instead of replacing
+        them. TLS context and proxy discovery are fixed when the session is created.
         """
         if self.closed:
             raise RuntimeError("Session is closed")
         if self._active:
             raise RuntimeError("Exit the active stream context before making another request")
         outgoing = _headers(self.headers)
+        if self.auth is not None and "authorization" not in outgoing:
+            outgoing["authorization"] = _basic_authorization(self.auth)
+        mentioned = {name.lower() for name in (headers or {})}
         for name, value in (headers or {}).items():
             _headers({name: "" if value is None else value})
             if value is None:
                 outgoing.pop(name.lower(), None)
             else:
                 outgoing[name.lower()] = value
+        if auth is not None and "authorization" not in mentioned:
+            outgoing["authorization"] = _basic_authorization(_auth_pair(auth))
         self._active = True
         try:
             with _request(
@@ -540,24 +721,31 @@ class Session:
             self._stream_response = None
 
     def get(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a GET request. See request() for arguments."""
         return self.request("GET", url, **kwargs)
 
     def post(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a POST request. See request() for arguments."""
         return self.request("POST", url, **kwargs)
 
     def put(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a PUT request. See request() for arguments."""
         return self.request("PUT", url, **kwargs)
 
     def patch(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a PATCH request. See request() for arguments."""
         return self.request("PATCH", url, **kwargs)
 
     def delete(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a DELETE request. See request() for arguments."""
         return self.request("DELETE", url, **kwargs)
 
     def head(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send a HEAD request. See request() for arguments."""
         return self.request("HEAD", url, **kwargs)
 
     def options(self, url: str, **kwargs: Unpack[_SessionOptions]) -> Response:
+        """Send an OPTIONS request. See request() for arguments."""
         return self.request("OPTIONS", url, **kwargs)
 
 
@@ -596,7 +784,11 @@ def _origin(url: str) -> tuple[str, str | None, int]:
 
 
 def _headers(values: Mapping[str, str] | None) -> dict[str, str]:
-    result = {"user-agent": f"fetch.py/{__version__}", "accept-encoding": "gzip"}
+    result = {
+        "user-agent": f"fetch.py/{__version__}",
+        "accept": "*/*",
+        "accept-encoding": "gzip",
+    }
     for name, value in (values or {}).items():
         if not isinstance(name, str) or not _TOKEN.fullmatch(name):
             raise ValueError("Header names must be HTTP tokens")
@@ -604,11 +796,114 @@ def _headers(values: Mapping[str, str] | None) -> dict[str, str]:
             ord(c) < 32 and c != "\t" or ord(c) == 127 for c in value
         ):
             raise ValueError("Header values must be strings without control characters")
-        value.encode("latin-1")
+        try:
+            value.encode("latin-1")
+        except UnicodeEncodeError:
+            raise ValueError("Header values must be latin-1 strings") from None
         result[name.lower()] = value
     if "transfer-encoding" in result or "content-length" in result:
         raise ValueError("fetch calculates Content-Length; do not set body framing headers")
     return result
+
+
+def _declared_charset(headers: Headers) -> str | None:
+    message = Message()
+    message["content-type"] = headers.get("content-type", "")
+    return message.get_content_charset()
+
+
+def _text_encoding(headers: Headers, content: bytes) -> str:
+    declared = _declared_charset(headers)
+    if declared:
+        # UTF-8 codecs keep a leading BOM as a character. Drop that mark.
+        if declared.lower().replace("_", "-") in _UTF8 and content.startswith(b"\xef\xbb\xbf"):
+            return "utf-8-sig"
+        return declared
+    if content.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        return "utf-32"
+    if content.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return "utf-16"
+    if content.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    return "utf-8"
+
+
+def _gzip_encoded(headers: Headers) -> bool:
+    # x-gzip is the historical name for gzip. Mixed coding lists are not
+    # decoded; only a single gzip coding is.
+    return headers.get("content-encoding", "").strip().lower() in _GZIP
+
+
+def _auth_pair(auth: object) -> tuple[str, str]:
+    if isinstance(auth, (str, bytes)) or not isinstance(auth, Sequence) or len(auth) != 2:
+        raise TypeError("auth must be a (username, password) pair of strings")
+    username, password = auth
+    if not isinstance(username, str) or not isinstance(password, str):
+        raise TypeError("auth must be a (username, password) pair of strings")
+    if any(ord(char) < 32 or ord(char) == 127 for char in f"{username}{password}"):
+        raise ValueError("auth credentials must not contain control characters")
+    return username, password
+
+
+def _basic_authorization(auth: tuple[str, str]) -> str:
+    token = base64.b64encode(f"{auth[0]}:{auth[1]}".encode()).decode("ascii")
+    return f"Basic {token}"
+
+
+def _drop_none(items: Mapping[Any, Any] | Iterable[tuple[Any, Any]]) -> list[tuple[Any, Any]]:
+    """Copy query or form pairs, skipping None and keeping real sequences.
+
+    None means the field was left unset. Strings and bytes stay one value,
+    matching urllib's doseq rules so optional fields do not become "None".
+    """
+    source = items.items() if isinstance(items, Mapping) else items
+    pairs: list[tuple[Any, Any]] = []
+    for key, value in source:
+        if isinstance(value, (str, bytes, bytearray, memoryview)):
+            pairs.append((key, value))
+            continue
+        try:
+            length = len(value)
+        except TypeError:
+            if value is not None:
+                pairs.append((key, value))
+            continue
+        if length:
+            kept = tuple(item for item in value if item is not None)
+            if kept:
+                pairs.append((key, kept))
+    return pairs
+
+
+def _flat(response: Response | StreamResponse) -> Response:
+    """A redirect hop with no nested history. Streamed hops keep an empty body."""
+    content = response.content if isinstance(response, Response) else b""
+    return Response(
+        response.status,
+        response.headers,
+        content,
+        response.url,
+        response.reason,
+        response.elapsed,
+    )
+
+
+def _carry(
+    response: Response | StreamResponse, history: tuple[Response, ...]
+) -> Response | StreamResponse:
+    """Attach redirect history without nesting it inside earlier hops."""
+    if isinstance(response, StreamResponse):
+        response.history = history
+        return response
+    return Response(
+        response.status,
+        response.headers,
+        response.content,
+        response.url,
+        response.reason,
+        response.elapsed,
+        history,
+    )
 
 
 def _validate_limits(timeout: float, max_redirects: int) -> None:
@@ -630,20 +925,31 @@ def request(
     params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
     headers: Mapping[str, str] | None = None,
     json: Any = _UNSET,
-    data: bytes | str | Mapping[str, Any] | None = None,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
     timeout: float = 30.0,
     follow_redirects: bool = True,
     max_redirects: int = 10,
     check_status: bool = True,
     trust_env: bool = False,
     context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
 ) -> Response:
     """Send one request using a temporary session; no state survives the call.
 
-    HTTP 4xx/5xx raise unless check_status=False. timeout limits individual
-    socket operations. See Session.request for body, query, and header options.
-    trust_env opts into urllib's environment/system proxy discovery.
-    context supplies a custom TLS context, e.g. for a private certificate CA.
+    HTTP 4xx/5xx raise unless check_status=False. timeout limits each socket
+    operation, not the whole call. trust_env opts into urllib's environment
+    and system proxy discovery. context supplies a custom TLS context, for
+    example a private certificate authority.
+
+    params adds query parameters. Sequence values repeat the key, and None
+    values are left out. json sends any JSON value, including None, as UTF-8.
+    data sends bytes, UTF-8 text, or a form mapping. Use json or data, not both.
+    auth sends Basic credentials unless headers already set Authorization.
+
+    The returned response includes elapsed seconds and any redirect history.
+    Redirects keep the method and body, except POST on 301 or 302 and any
+    non-HEAD method on 303, which become GET. Credentials are removed when
+    the origin changes. An HTTPS to HTTP redirect is refused.
     """
     with Session(
         timeout=timeout,
@@ -653,7 +959,15 @@ def request(
         trust_env=trust_env,
         context=context,
     ) as session:
-        return session.request(method, url, params=params, headers=headers, json=json, data=data)
+        return session.request(
+            method,
+            url,
+            params=params,
+            headers=headers,
+            json=json,
+            data=data,
+            auth=auth,
+        )
 
 
 @contextmanager
@@ -664,15 +978,19 @@ def stream(
     params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
     headers: Mapping[str, str] | None = None,
     json: Any = _UNSET,
-    data: bytes | str | Mapping[str, Any] | None = None,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
     timeout: float = 30.0,
     follow_redirects: bool = True,
     max_redirects: int = 10,
     check_status: bool = True,
     trust_env: bool = False,
     context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
 ) -> Iterator[StreamResponse]:
-    """Stream a response inside a with block, using a temporary session."""
+    """Stream a response inside a with block, using a temporary session.
+
+    Arguments match request(). The body is not read until the caller asks.
+    """
     with (
         Session(
             timeout=timeout,
@@ -683,7 +1001,7 @@ def stream(
             context=context,
         ) as session,
         session.stream(
-            method, url, params=params, headers=headers, json=json, data=data
+            method, url, params=params, headers=headers, json=json, data=data, auth=auth
         ) as response,
     ):
         yield response
@@ -718,7 +1036,7 @@ def _request(
     params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None,
     headers: Mapping[str, str],
     json: Any,
-    data: bytes | str | Mapping[str, Any] | None,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None,
     timeout: float,
     follow_redirects: bool,
     max_redirects: int,
@@ -726,9 +1044,10 @@ def _request(
 ) -> Iterator[Response | StreamResponse]:
     """Send a request. HTTP 4xx/5xx raise HTTPError unless check_status=False.
 
-    params appends query parameters; sequence values become repeated keys.
-    json serializes any JSON value (including None). data sends bytes, UTF-8
-    text, or a mapping encoded as a form. json and data are mutually exclusive.
+    params appends query parameters; sequence values become repeated keys
+    and None values are omitted. json serializes any JSON value (including
+    None). data sends bytes, UTF-8 text, or a mapping encoded as a form.
+    json and data are mutually exclusive.
 
     timeout is a positive socket-operation timeout, not a total deadline.
 
@@ -744,27 +1063,29 @@ def _request(
         raise ValueError("Use either json or data, not both")
     url = _url(url)
     if params is not None:
-        query = urllib.parse.urlencode(
-            cast(Mapping[str, Any], params) if isinstance(params, Mapping) else list(params),
-            doseq=True,
-        )
+        if isinstance(params, (str, bytes, bytearray, memoryview)):
+            raise TypeError("params must be a mapping or a sequence of pairs")
+        query = urllib.parse.urlencode(_drop_none(params), doseq=True)
         if query:
             url += ("&" if urllib.parse.urlsplit(url).query else "?") + query
     outgoing = _headers(headers)
     body = None
     if json is not _UNSET:
-        body = _json.dumps(json, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        try:
+            body = _json.dumps(
+                json, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            ).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("json values must be valid Unicode text") from exc
         outgoing.setdefault("content-type", "application/json")
     elif isinstance(data, Mapping):
-        body = urllib.parse.urlencode(data, doseq=True).encode("ascii")
+        body = urllib.parse.urlencode(_drop_none(data), doseq=True).encode("ascii")
         outgoing.setdefault("content-type", "application/x-www-form-urlencoded")
     elif isinstance(data, str):
         body = data.encode("utf-8")
         outgoing.setdefault("content-type", "text/plain; charset=utf-8")
-    elif isinstance(data, bytes):
-        body = data
+    elif isinstance(data, (bytes, bytearray, memoryview)):
+        body = bytes(data)
         outgoing.setdefault("content-type", "application/octet-stream")
     elif data is not None:
         raise TypeError("data must be bytes, str, or a mapping")
@@ -772,6 +1093,7 @@ def _request(
     started = time.perf_counter()
     status: int | None = None
     hop = 0
+    prior: list[Response] = []
 
     def record(event: str, error: BaseException | None = None) -> None:
         if not _log.isEnabledFor(logging.DEBUG):
@@ -814,19 +1136,27 @@ def _request(
             with _open(opener, req, timeout) as raw:
                 # Keep the received status even if buffering the body fails.
                 status = int(raw.status)
-                with closing(StreamResponse(raw, url, discard)) as live:
+                with closing(StreamResponse(raw, url, discard, started)) as live:
                     cookies.extract_cookies(raw, req)
+                    live.elapsed = time.perf_counter() - started
                     response = live if streaming else live.read()
+                    # Location may carry trailing whitespace that would become
+                    # part of the next path. The field is one URI reference.
                     location = response.headers.get("location")
+                    if location is not None:
+                        location = location.strip()
                     if follow_redirects and status in _REDIRECTS and location:
+                        carried = _carry(response, tuple(prior))
                         if hop == max_redirects:
-                            raise RedirectError(response)
+                            raise RedirectError(carried)
                         try:
                             target = _url(urllib.parse.urljoin(url, location))
                         except (ValueError, UnicodeError) as exc:
-                            raise RedirectError(response) from exc
-                        if url.startswith("https:") and target.startswith("http:"):
-                            raise RedirectError(response)
+                            raise RedirectError(carried) from exc
+                        current_scheme = urllib.parse.urlsplit(url).scheme
+                        target_scheme = urllib.parse.urlsplit(target).scheme
+                        if current_scheme == "https" and target_scheme == "http":
+                            raise RedirectError(carried)
                         record("redirect")
                         if _origin(url) != _origin(target):
                             for name in ("authorization", "cookie", "proxy-authorization"):
@@ -839,13 +1169,15 @@ def _request(
                             for name in list(outgoing):
                                 if name.startswith("content-"):
                                     del outgoing[name]
+                        prior.append(_flat(response))
                         url = target
                         continue
+                    carried = _carry(response, tuple(prior))
                     if check_status:
-                        response.raise_for_status()
-                    if isinstance(response, StreamResponse):
-                        streamed = response
-                    yield response
+                        carried.raise_for_status()
+                    if isinstance(carried, StreamResponse):
+                        streamed = carried
+                    yield carried
                     return
         raise AssertionError("unreachable")
     except BaseException as exc:
@@ -864,10 +1196,232 @@ def _request(
         record(event, error)
 
 
-get = partial(request, "GET")
-post = partial(request, "POST")
-put = partial(request, "PUT")
-patch = partial(request, "PATCH")
-delete = partial(request, "DELETE")
-head = partial(request, "HEAD")
-options = partial(request, "OPTIONS")
+def get(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send a GET request. Arguments and errors match request()."""
+    return request(
+        "GET",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
+
+
+def post(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send a POST request. Arguments and errors match request()."""
+    return request(
+        "POST",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
+
+
+def put(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send a PUT request. Arguments and errors match request()."""
+    return request(
+        "PUT",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
+
+
+def patch(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send a PATCH request. Arguments and errors match request()."""
+    return request(
+        "PATCH",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
+
+
+def delete(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send a DELETE request. Arguments and errors match request()."""
+    return request(
+        "DELETE",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
+
+
+def head(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send a HEAD request. Arguments and errors match request()."""
+    return request(
+        "HEAD",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
+
+
+def options(
+    url: str,
+    *,
+    params: Mapping[str, Any] | Iterable[tuple[str, Any]] | None = None,
+    headers: Mapping[str, str] | None = None,
+    json: Any = _UNSET,
+    data: bytes | bytearray | memoryview | str | Mapping[str, Any] | None = None,
+    timeout: float = 30.0,
+    follow_redirects: bool = True,
+    max_redirects: int = 10,
+    check_status: bool = True,
+    trust_env: bool = False,
+    context: ssl.SSLContext | None = None,
+    auth: tuple[str, str] | None = None,
+) -> Response:
+    """Send an OPTIONS request. Arguments and errors match request()."""
+    return request(
+        "OPTIONS",
+        url,
+        params=params,
+        headers=headers,
+        json=json,
+        data=data,
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        max_redirects=max_redirects,
+        check_status=check_status,
+        trust_env=trust_env,
+        context=context,
+        auth=auth,
+    )
