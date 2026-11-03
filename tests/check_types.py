@@ -19,6 +19,10 @@ class User(BaseModel):
 def check(response: fetch.Response) -> None:
     assert_type(fetch.get("https://example.com", timeout=5), fetch.Response)
     assert_type(fetch.post("https://example.com", json={"name": "Jo"}), fetch.Response)
+    assert_type(fetch.get("https://example.com", auth=("user", "pw")), fetch.Response)
+    assert_type(response.elapsed, float)
+    assert_type(response.history, tuple[fetch.Response, ...])
+    assert_type(response.encoding, str | None)
     assert_type(response.parse(int), int)
     assert_type(response.parse(User.model_validate_json), User)
     assert_type(response.parse(TypeAdapter(list[User]).validate_json), list[User])
@@ -31,6 +35,10 @@ def check(response: fetch.Response) -> None:
         with session.stream("GET", "https://example.com", timeout=2) as stream:
             assert_type(stream, fetch.StreamResponse)
             assert_type(stream.iter_bytes(), Iterator[bytes])
-    with fetch.stream("GET", "https://example.com") as stream:
+            assert_type(stream.elapsed, float)
+            assert_type(stream.history, tuple[fetch.Response, ...])
+            assert_type(stream.encoding, str | None)
+    with fetch.stream("GET", "https://example.com", auth=("user", "pw")) as stream:
         assert_type(stream.read(), fetch.Response)
         assert_type(stream.read().parse(User.model_validate_json), User)
+        assert_type(stream.read().history, tuple[fetch.Response, ...])

@@ -27,7 +27,9 @@ complete `Response`; a stream context yields a `StreamResponse`.
 
 | Operation | Behavior |
 | --- | --- |
-| `status`, `reason`, `url`, `headers`, `ok` | Inspect metadata without reading the body |
+| `status`, `reason`, `url`, `headers`, `ok`, `encoding` | Inspect metadata without reading the body |
+| `elapsed` | Seconds from the start of the call until the headers arrived |
+| `history` | Redirect hops already followed; their bodies are empty |
 | `iter_bytes(chunk_size=65536)` | Claim the body and yield up to that many decoded bytes per chunk |
 | `read()` | Buffer an unclaimed body into an ordinary `Response` |
 | `raise_for_status()` | Check status without reading the body |
@@ -50,8 +52,9 @@ with fetch.stream("GET", "https://api.example.com/me") as r:
 print(response.json())
 ```
 
-`read()` allocates the full decoded body and returns a `Response`. Repeating it
-returns the same object, including after context exit. Streaming itself has no
+`read()` allocates the full decoded body and returns a `Response`. Its `elapsed`
+includes reading and decoding the body. Repeating it returns the same object,
+including after context exit. Streaming itself has no
 `.content`, `.text`, `.json()`, or `.parse()` that could hide network reads.
 Use those methods on the buffered response instead.
 
@@ -117,9 +120,10 @@ redirects, cookies, status rules, and the session transport. Buffered calls coll
 that reader's output into a `Response`. Incremental reads use `http.client`'s
 `read1()`; a small reader also detects premature EOF for fixed-length bodies.
 Gzip decoding uses the standard library with bounded output and supports
-concatenated members and checksum validation. Headers retain their received
-values, so `Content-Length` can describe compressed bytes rather than the bytes
-yielded. Other content encodings are passed through, as with buffered requests.
+concatenated members and checksum validation. `x-gzip` is decoded as gzip.
+Headers retain their received values, so `Content-Length` can describe compressed
+bytes rather than the bytes yielded. Other content encodings are passed through,
+as with buffered requests.
 
 The relevant standard-library contracts are [HTTP response reads and reuse](https://docs.python.org/3/library/http.client.html#httpresponse-objects)
 and [gzip file reads](https://docs.python.org/3/library/gzip.html#gzip.GzipFile).
