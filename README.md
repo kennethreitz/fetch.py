@@ -99,15 +99,19 @@ with fetch.Session(headers={"User-Agent": "my-app/1.0"}, timeout=5) as s:
 
 Sessions have the same verbs as the module. Per-request options override session
 defaults; headers merge case-insensitively. `s.headers` is a dictionary whose
-keys are matched without regard to case. A header value of `None` removes a
-session header for that call. `auth=("user", "password")` on the session or on
-one call sends Basic credentials; `headers={"Authorization": None}` omits them
-for that call. Cookies live in `s.cookies`, a standard-library `CookieJar`.
+keys are stored and matched without regard to case, including later `update()`
+and `setdefault()` calls. A header value of `None` removes a session header for
+that call. `auth=("user", "password")` on the session or on one call sends Basic
+credentials; assigning `s.auth` replaces that default and is checked immediately.
+`headers={"Authorization": None}` omits credentials for that call. Cookies live
+in `s.cookies`, a standard-library `CookieJar`.
 
 Use `with`, or call `s.close()`. Each session is for sequential use and caches
 up to eight direct HTTP/HTTPS connections (`max_connections=8`). Proxy
-connections are not reused. Module-level calls use temporary sessions and
-share no state between calls. [Session details →](DOCS/sessions.md)
+connections are not reused. A cached connection the server has already closed
+is replaced before the next request is written. A failure after that write is
+not retried. Module-level calls use temporary sessions and share no state
+between calls. [Session details →](DOCS/sessions.md)
 
 ## Streaming
 
@@ -143,8 +147,9 @@ Exit the stream context before making another request through that session.
 | No retries | Failed requests are never automatically replayed |
 
 Redirects strip explicit credentials on an origin change. POST on 301/302 and
-non-HEAD on 303 become GET. Surrounding whitespace on a `Location` value is
-not part of the next URL. `json=` and `data=` are mutually exclusive;
+non-HEAD on 303 become GET. A 303 also drops the request body when the method
+stays HEAD. Surrounding whitespace on a `Location` value is not part of the
+next URL. `json=` and `data=` are mutually exclusive;
 fetch calculates `Content-Length` for you. `data` accepts `bytes`, `bytearray`,
 and `memoryview`. URLs may use Unicode or characters that are already
 percent-encoded.

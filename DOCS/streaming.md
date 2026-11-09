@@ -86,8 +86,8 @@ be reopened.
 Redirect decisions and cookie updates happen before the context yields. The
 streaming path closes intermediate redirect bodies without draining them, then
 opens the next hop. It therefore does not validate or retain skipped bodies.
-Method rewriting, credential stripping, limits, and HTTPS downgrade refusal
-match buffered requests.
+Method rewriting, the 303 body drop, credential stripping, limits, and HTTPS
+downgrade refusal match buffered requests.
 
 With `check_status=True`, 4xx/5xx raise on entry, before downloading the error
 body. `HTTPError.response` is a closed `StreamResponse` containing the metadata.

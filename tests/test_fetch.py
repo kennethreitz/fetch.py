@@ -61,6 +61,12 @@ class Handler(BaseHTTPRequestHandler):
         elif parts.path == "/x-gzip":
             content = gzip.compress(b'{"greeting":"hello"}')
             headers.append(("Content-Encoding", "X-Gzip"))
+        elif parts.path == "/gzip-comma":
+            content = gzip.compress(b'{"greeting":"hello"}')
+            headers.append(("Content-Encoding", "gzip,"))
+        elif parts.path == "/gzip-mixed":
+            content = gzip.compress(b'{"greeting":"hello"}')
+            headers.append(("Content-Encoding", "gzip, identity"))
         elif parts.path == "/bad-gzip":
             content = b"this is not gzip"
             headers.append(("Content-Encoding", "gzip"))
@@ -75,6 +81,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         for name, value in headers:
             self.send_header(name, value)
+        self.send_header("X-Method", self.command)
+        self.send_header("X-Body-Length", str(len(body)))
+        self.send_header("X-Request-Content-Type", self.headers.get("Content-Type", ""))
         self.send_header(
             "Content-Length", str(len(content) + (10 if parts.path == "/truncated" else 0))
         )
@@ -229,6 +238,12 @@ class FetchTests(unittest.TestCase):
             _ = headers["missing"]
         with self.assertRaises(TypeError):
             headers["new"] = "value"
+        left = fetch.Headers([("Set-Cookie", "a=1"), ("Set-Cookie", "b=2")])
+        right = fetch.Headers([("set-cookie", "a=1"), ("set-cookie", "b=2")])
+        self.assertEqual(left, right)
+        self.assertNotEqual(left, {"set-cookie": "a=1"})
+        self.assertEqual(fetch.Headers([("A", "1")]), {"a": "1"})
+        self.assertNotEqual(fetch.Headers([("A", "1")]), {"a": 1})
 
     def test_status_errors_and_opt_out(self):
         for status in (404, 503):
@@ -246,6 +261,9 @@ class FetchTests(unittest.TestCase):
     def test_gzip_charset_and_empty_responses(self):
         self.assertEqual(fetch.get(self.base + "/gzip").json(), {"greeting": "hello"})
         self.assertEqual(fetch.get(self.base + "/x-gzip").json(), {"greeting": "hello"})
+        self.assertEqual(fetch.get(self.base + "/gzip-comma").json(), {"greeting": "hello"})
+        mixed = fetch.get(self.base + "/gzip-mixed")
+        self.assertTrue(mixed.content.startswith(b"\x1f\x8b"))
         self.assertEqual(fetch.get(self.base + "/latin1").text, "caf\u00e9")
         response = fetch.get(self.base + "/status/204")
         self.assertEqual(response.content, b"")
@@ -292,6 +310,10 @@ class FetchTests(unittest.TestCase):
         response = fetch.head(self.redirect(303))
         self.assertEqual(response.status, 200)
         self.assertEqual(response.content, b"")
+        carried = fetch.head(self.redirect(303), data="payload")
+        self.assertEqual(carried.headers["x-method"], "HEAD")
+        self.assertEqual(carried.headers["x-body-length"], "0")
+        self.assertEqual(carried.headers["x-request-content-type"], "")
 
     def test_redirect_credentials_stay_on_origin(self):
         headers = {
@@ -520,11 +542,16 @@ class FetchTests(unittest.TestCase):
             (("GET", self.base), {"auth": ("bad\nuser", "secret")}),
             (("POST", self.base), {"json": "\ud800"}),
             (("GET", self.base), {"params": "q=1"}),
+            (("POST", self.base), {"data": "\ud800"}),
+            (("GET", self.base), {"params": {"q": "\ud800"}}),
+            (("POST", self.base), {"data": {"q": "\ud800"}}),
+            (("GET", self.base), {"auth": ("\ud800", "secret")}),
         ]
         for args, kwargs in cases:
             with self.subTest(args=args, kwargs=kwargs), capture_logs() as records:
-                with self.assertRaises((ValueError, TypeError)):
+                with self.assertRaises((ValueError, TypeError)) as caught:
                     fetch.request(*args, **kwargs)
+                self.assertNotIsInstance(caught.exception, UnicodeError)
                 self.assertEqual(records, [])
 
     def test_verbs_share_the_request_signature(self):

@@ -1,7 +1,9 @@
 """Session contracts, including real socket reuse and failure recovery."""
 
+import base64
 import http.cookiejar
 import json
+import select
 import shutil
 import socket
 import ssl
@@ -86,6 +88,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(content)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        if parts.path == "/idle-close":
+            # Close after a normal keep-alive response so the client caches a dead socket.
+            self.close_connection = True
 
     do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = respond
 
@@ -236,6 +241,52 @@ class SessionTests(unittest.TestCase):
             self.assertTrue(second.finished[1].wait(1))
             self.assertEqual(session.get(first.url).json()["connection"], 1)
             self.assertEqual(session.get(second.url).json()["connection"], 2)
+
+    def test_header_writes_stay_lowercase(self):
+        with fetch.Session() as session:
+            session.headers.setdefault("X-Token", "first")
+            session.headers.setdefault("x-token", "second")
+            with self.assertRaises(TypeError):
+                session.headers.setdefault("X-Missing")
+            session.headers.update([("X-From", "pair")])
+            merged = session.headers | {"X-Or": "yes"}
+            self.assertEqual(session.headers["X-TOKEN"], "first")
+            self.assertEqual(session.headers["x-from"], "pair")
+            self.assertEqual(
+                [key for key in session.headers if key.lower() == "x-token"], ["x-token"]
+            )
+            self.assertEqual(merged["x-or"], "yes")
+            self.assertEqual([key for key in merged if "or" in key], ["x-or"])
+            sent = session.get(self.url).json()["headers"]
+            self.assertEqual(sent["x-token"], "first")
+            self.assertEqual(sent["x-from"], "pair")
+
+    def test_auth_assignment_is_checked_immediately(self):
+        with fetch.Session(auth=("user", "secret")) as session:
+            with self.assertRaises(ValueError):
+                session.auth = ("bad\n", "x")
+            self.assertEqual(session.auth, ("user", "secret"))
+            session.auth = ("other", "secret")
+            token = base64.b64encode(b"other:secret").decode()
+            self.assertEqual(
+                session.get(self.url).json()["headers"]["authorization"], f"Basic {token}"
+            )
+            session.auth = None
+            self.assertIsNone(session.auth)
+            self.assertNotIn("authorization", session.get(self.url).json()["headers"])
+
+    def test_idle_closed_connection_is_replaced_before_send(self):
+        with fetch.Session() as session:
+            first = session.get(self.url + "/idle-close").json()["connection"]
+            self.assertTrue(self.server.finished[first].wait(1))
+            # The next request must observe this FIN and open a new socket.
+            cached = next(iter(session._transport.connections.values()))
+            readable, _, _ = select.select([cached.sock], [], [], 1)
+            self.assertTrue(readable, "server close did not reach the cached socket")
+            second = session.get(self.url).json()["connection"]
+            third = session.get(self.url).json()["connection"]
+        self.assertEqual((first, second, third), (1, 2, 2))
+        self.assertEqual(self.server.accepted, 2)
 
     def test_server_and_client_connection_close_are_respected(self):
         with fetch.Session() as session:
