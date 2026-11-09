@@ -38,6 +38,7 @@ import json as _json
 import logging
 import math
 import re
+import select
 import ssl
 import time
 import urllib.error
@@ -48,7 +49,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from email.message import Message
-from typing import Any, Self, TypedDict, TypeVar, Unpack
+from typing import Any, Self, TypedDict, TypeVar, Unpack, cast
 
 __version__ = "0.2.0"
 __all__ = [
@@ -122,6 +123,22 @@ class Headers(Mapping[str, str]):
     def get_all(self, name: str) -> list[str]:
         """Return every value for this field, in the order they arrived."""
         return [value for key, value in self._items if key.lower() == name.lower()]
+
+    def __eq__(self, other: object) -> bool:
+        """Equal when names match without case and repeated values match in order."""
+        if isinstance(other, Headers):
+            return _folded_headers(self._items) == _folded_headers(other._items)
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        folded: dict[str, list[str]] = {}
+        for name in other:
+            if not isinstance(name, str):
+                return False
+            value = other[name]
+            if not isinstance(value, str):
+                return False
+            folded.setdefault(name.lower(), []).append(value)
+        return _folded_headers(self._items) == folded
 
 
 class Error(Exception):
@@ -379,6 +396,26 @@ class StreamResponse:
         return self._buffered
 
 
+def _folded_headers(items: Iterable[tuple[str, str]]) -> dict[str, list[str]]:
+    folded: dict[str, list[str]] = {}
+    for name, value in items:
+        folded.setdefault(name.lower(), []).append(value)
+    return folded
+
+
+def _socket_unusable(sock: Any) -> bool:
+    """An idle socket is unusable when it is closed or already has data waiting.
+
+    A zero timeout does not write. Readable means a FIN or unexpected bytes,
+    so the next request has to open a new connection instead of sending on this one.
+    """
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    return bool(readable)
+
+
 class _ReturnResponse(urllib.request.HTTPErrorProcessor):
     # urllib normally turns errors into exceptions and follows redirects itself.
     # Keep both decisions here so all verbs and all statuses behave consistently.
@@ -413,6 +450,15 @@ class _SessionTransport(urllib.request.HTTPHandler, urllib.request.HTTPSHandler)
             return super().do_open(http_class, req, **kwargs)
         key = (req.type, req.host)
         connection = self.connections.pop(key, None)
+        if (
+            connection is not None
+            and connection.sock is not None
+            and _socket_unusable(connection.sock)
+        ):
+            # The server already hung up. Drop the socket before writing so
+            # this request is not a replay of one that failed in flight.
+            connection.close()
+            connection = None
         if connection is None:
             connection = http_class(req.host, timeout=req.timeout, **kwargs)
         headers = {name.title(): value for name, value in req.header_items()}
@@ -476,17 +522,38 @@ class _HeaderDict(dict[str, str]):
     def pop(self, key: str, *args: Any) -> Any:
         return super().pop(key.lower(), *args)
 
+    def setdefault(self, key: str, default: str | None = None) -> str:
+        folded = key.lower()
+        if folded in self:
+            return self[folded]
+        if not isinstance(default, str):
+            raise TypeError("Header values must be strings")
+        self[folded] = default
+        return default
+
     def update(  # type: ignore[override]
-        self, values: Mapping[str, str] | None = None, **kwargs: str
+        self,
+        values: Mapping[str, str] | Iterable[tuple[str, str]] | None = None,
+        **kwargs: str,
     ) -> None:
-        if values is not None:
-            for key, value in values.items():
+        if isinstance(values, Mapping):
+            for key, value in cast(Mapping[str, str], values).items():
+                self[key] = value
+        elif values is not None:
+            for key, value in cast(Iterable[tuple[str, str]], values):
                 self[key] = value
         for key, value in kwargs.items():
             self[key] = value
 
     def copy(self) -> _HeaderDict:
         return _HeaderDict(self)
+
+    def __or__(self, other: Mapping[str, str]) -> _HeaderDict:  # type: ignore[override]
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        merged = self.copy()
+        merged.update(other)
+        return merged
 
 
 class _SessionOptions(TypedDict, total=False):
@@ -506,7 +573,9 @@ class Session:
 
     Use as a context manager or call close(). One session is for sequential
     use; use separate sessions for concurrent work. Proxy connections are not
-    cached. A closed session cannot be reused, and failures are never retried.
+    cached. A closed session cannot be reused. A cached socket that is already
+    closed is replaced before the next request is written. A failure after
+    that write is not retried.
     """
 
     def __init__(
@@ -541,7 +610,7 @@ class Session:
         self.follow_redirects = follow_redirects
         self.max_redirects = max_redirects
         self.check_status = check_status
-        self.auth = None if auth is None else _auth_pair(auth)
+        self.auth = auth
         self.cookies = http.cookiejar.CookieJar(
             http.cookiejar.DefaultCookiePolicy(
                 strict_ns_domain=http.cookiejar.DefaultCookiePolicy.DomainStrictNonDomain
@@ -556,6 +625,15 @@ class Session:
         self._closed = False
         self._active = False
         self._stream_response: StreamResponse | None = None
+
+    @property
+    def auth(self) -> tuple[str, str] | None:
+        """Basic credentials used when a call does not set its own, or None."""
+        return self._auth
+
+    @auth.setter
+    def auth(self, value: tuple[str, str] | None) -> None:
+        self._auth = None if value is None else _auth_pair(value)
 
     @property
     def closed(self) -> bool:
@@ -829,9 +907,11 @@ def _text_encoding(headers: Headers, content: bytes) -> str:
 
 
 def _gzip_encoded(headers: Headers) -> bool:
-    # x-gzip is the historical name for gzip. Mixed coding lists are not
-    # decoded; only a single gzip coding is.
-    return headers.get("content-encoding", "").strip().lower() in _GZIP
+    # x-gzip is the historical name for gzip. One coding only; a list such as
+    # "gzip, identity" is left unchanged. A trailing comma is not a second coding.
+    value = headers.get("content-encoding", "")
+    codings = [part.strip().lower() for part in value.split(",") if part.strip()]
+    return len(codings) == 1 and codings[0] in _GZIP
 
 
 def _auth_pair(auth: object) -> tuple[str, str]:
@@ -842,6 +922,10 @@ def _auth_pair(auth: object) -> tuple[str, str]:
         raise TypeError("auth must be a (username, password) pair of strings")
     if any(ord(char) < 32 or ord(char) == 127 for char in f"{username}{password}"):
         raise ValueError("auth credentials must not contain control characters")
+    try:
+        f"{username}:{password}".encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("auth credentials must be valid Unicode text") from exc
     return username, password
 
 
@@ -948,8 +1032,9 @@ def request(
 
     The returned response includes elapsed seconds and any redirect history.
     Redirects keep the method and body, except POST on 301 or 302 and any
-    non-HEAD method on 303, which become GET. Credentials are removed when
-    the origin changes. An HTTPS to HTTP redirect is refused.
+    non-HEAD method on 303, which become GET. A 303 drops the body for HEAD
+    too. Credentials are removed when the origin changes. An HTTPS to HTTP
+    redirect is refused.
     """
     with Session(
         timeout=timeout,
@@ -1051,9 +1136,10 @@ def _request(
 
     timeout is a positive socket-operation timeout, not a total deadline.
 
-    Redirects preserve methods/bodies except POST on 301/302 and non-HEAD
-    methods on 303, which become GET. Credentials are stripped when origins
-    change; HTTPS-to-HTTP redirects are refused. No retries are performed.
+    Redirects preserve methods and bodies except POST on 301/302 and non-HEAD
+    methods on 303, which become GET. A 303 drops the body for HEAD as well.
+    Credentials are stripped when origins change; HTTPS-to-HTTP redirects are
+    refused. A failure after the request is written is not retried.
     """
     if not isinstance(method, str) or not _TOKEN.fullmatch(method):
         raise ValueError("method must be an HTTP token")
@@ -1065,7 +1151,10 @@ def _request(
     if params is not None:
         if isinstance(params, (str, bytes, bytearray, memoryview)):
             raise TypeError("params must be a mapping or a sequence of pairs")
-        query = urllib.parse.urlencode(_drop_none(params), doseq=True)
+        try:
+            query = urllib.parse.urlencode(_drop_none(params), doseq=True)
+        except UnicodeEncodeError as exc:
+            raise ValueError("query parameters must be valid Unicode text") from exc
         if query:
             url += ("&" if urllib.parse.urlsplit(url).query else "?") + query
     outgoing = _headers(headers)
@@ -1079,10 +1168,16 @@ def _request(
             raise ValueError("json values must be valid Unicode text") from exc
         outgoing.setdefault("content-type", "application/json")
     elif isinstance(data, Mapping):
-        body = urllib.parse.urlencode(_drop_none(data), doseq=True).encode("ascii")
+        try:
+            body = urllib.parse.urlencode(_drop_none(data), doseq=True).encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ValueError("form values must be valid Unicode text") from exc
         outgoing.setdefault("content-type", "application/x-www-form-urlencoded")
     elif isinstance(data, str):
-        body = data.encode("utf-8")
+        try:
+            body = data.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("data text must be valid Unicode text") from exc
         outgoing.setdefault("content-type", "text/plain; charset=utf-8")
     elif isinstance(data, (bytes, bytearray, memoryview)):
         body = bytes(data)
@@ -1162,10 +1257,12 @@ def _request(
                             for name in ("authorization", "cookie", "proxy-authorization"):
                                 outgoing.pop(name, None)
                         outgoing.pop("host", None)
-                        if (status in {301, 302} and method == "POST") or (
-                            status == 303 and method != "HEAD"
-                        ):
-                            method, body = "GET", None
+                        # 303 means "see other": resend no body. HEAD stays HEAD.
+                        # 301 and 302 only rewrite POST, matching historical clients.
+                        if (status in {301, 302} and method == "POST") or status == 303:
+                            if not (status == 303 and method == "HEAD"):
+                                method = "GET"
+                            body = None
                             for name in list(outgoing):
                                 if name.startswith("content-"):
                                     del outgoing[name]

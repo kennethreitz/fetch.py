@@ -46,11 +46,16 @@ with fetch.Session(headers={"Authorization": "Bearer ..."}) as s:
 
 A `None` header removes a session header for that call. Built-in transport headers
 may still be supplied, and the cookie jar may still add applicable cookies.
-`s.headers` is a mutable dictionary. Set `s.timeout`, `s.follow_redirects`,
-`s.max_redirects`, or `s.check_status` to change future defaults.
+`s.headers` is a mutable dictionary. Names are stored in lowercase: item
+assignment, `update()` (from a mapping or pairs), `setdefault()`, and `|` all
+keep that rule. Set `s.timeout`, `s.follow_redirects`, `s.max_redirects`,
+`s.check_status`, or `s.auth` to change future defaults. Assigning `s.auth`
+checks the pair immediately and leaves the previous value in place when the
+new one is invalid.
 
 `auth=("username", "password")` adds `Authorization: Basic ...` when that header
-is not already set. Credentials are UTF-8. Per-request `auth` replaces the
+is not already set. Credentials are UTF-8, and a lone surrogate is a
+`ValueError` before any request is sent. Per-request `auth` replaces the
 session pair for that call. An explicit `Authorization` header wins, and
 `headers={"Authorization": None}` sends the call with no credentials. A
 cross-origin redirect drops the header and does not put `auth` back.
@@ -84,8 +89,12 @@ Buffered bodies are fully consumed before returning a response or raising `HTTPE
 That makes reuse safe even after a 404. A transport or body-decoding failure
 discards only the failed connection; cached connections to other servers remain
 available. Invalid request arguments leave existing connections alone.
-No failed request is automatically replayed. A server silently closing an idle
-connection can therefore cause the next request to raise `RequestError`.
+Before a cached connection is reused, the session checks whether the idle socket
+is already closed or has unexpected data waiting. That socket is discarded and
+a new one is opened, so a server that hung up after the previous response does
+not fail the next request. The check does not write the request. If the server
+closes the socket after that check, or the connection fails while the request
+is being written, the call raises `RequestError` and is not sent again.
 
 The timeout applies to each socket operation, including reused sockets. It is
 not an overall request deadline or a connection idle-expiry setting.
