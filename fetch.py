@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from email.message import Message
 from typing import Any, Self, TypedDict, TypeVar, Unpack, cast
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __all__ = [
     "DecodeError",
     "Error",
